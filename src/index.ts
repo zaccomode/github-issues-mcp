@@ -1,73 +1,55 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpAgent } from "agents/mcp";
-import { z } from "zod";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
+import { createMcpHandler } from "agents/mcp";
+import { allowedLogins, authorizeHandler } from "./authorize";
+import { createGitHubIssuesServer } from "./tools";
 
-// Define our MCP agent with tools
-export class MyMCP extends McpAgent {
-	server = new McpServer({
-		name: "Authless Calculator",
-		version: "1.0.0",
-	});
+const MCP_ROUTE = "/mcp";
 
-	async init() {
-		// Simple addition tool
-		this.server.registerTool(
-			"add",
-			{ inputSchema: { a: z.number(), b: z.number() } },
-			async ({ a, b }) => ({
-				content: [{ type: "text", text: String(a + b) }],
-			}),
-		);
-
-		// Calculator tool with multiple operations
-		this.server.registerTool(
-			"calculate",
-			{
-				inputSchema: {
-					operation: z.enum(["add", "subtract", "multiply", "divide"]),
-					a: z.number(),
-					b: z.number(),
-				},
-			},
-			async ({ operation, a, b }) => {
-				let result: number;
-				switch (operation) {
-					case "add":
-						result = a + b;
-						break;
-					case "subtract":
-						result = a - b;
-						break;
-					case "multiply":
-						result = a * b;
-						break;
-					case "divide":
-						if (b === 0)
-							return {
-								content: [
-									{
-										type: "text",
-										text: "Error: Cannot divide by zero",
-									},
-								],
-							};
-						result = a / b;
-						break;
-				}
-				return { content: [{ type: "text", text: String(result) }] };
-			},
-		);
-	}
+/** What we stashed in the grant at /authorize. Encrypted at rest by the provider. */
+interface GrantProps {
+	login: string;
+	pat: string;
 }
 
-export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
-		const url = new URL(request.url);
+/**
+ * Runs only for requests the OAuth provider has already authenticated, so the
+ * bearer token here is one we issued — the GitHub PAT arrives out of band in
+ * `ctx.props` and never travels with the request.
+ */
+const mcpApiHandler = {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const props = ctx.props as GrantProps | undefined;
 
-		if (url.pathname === "/mcp") {
-			return MyMCP.serve("/mcp").fetch(request, env, ctx);
+		if (!props?.pat) {
+			return problem(
+				401,
+				"This grant carries no GitHub token. Reconnect to authorise again.",
+			);
 		}
 
-		return new Response("Not found", { status: 404 });
+		// Re-checked on every request rather than trusting the check made at
+		// authorize time, so removing a login from ALLOWED_LOGINS immediately
+		// disables grants that were already issued to it.
+		if (!allowedLogins(env).includes(props.login.toLowerCase())) {
+			return problem(403, `GitHub user '${props.login}' is no longer authorised.`);
+		}
+
+		const server = createGitHubIssuesServer(props.pat, props.login);
+		return createMcpHandler(server, { route: MCP_ROUTE })(request, env, ctx);
 	},
 };
+
+function problem(status: number, message: string): Response {
+	return new Response(JSON.stringify({ error: message }), {
+		status,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+export default new OAuthProvider({
+	apiHandlers: { [MCP_ROUTE]: mcpApiHandler },
+	authorizeEndpoint: "/authorize",
+	tokenEndpoint: "/token",
+	clientRegistrationEndpoint: "/register",
+	defaultHandler: authorizeHandler,
+});
