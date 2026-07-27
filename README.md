@@ -116,6 +116,9 @@ webhooks.
 npm run check   # lint + type-check
 ```
 
+[TESTING.md](./TESTING.md) is the runbook for proving it actually works —
+what has already been verified, what hasn't, and the order to test in.
+
 ## Design notes
 
 **Where the credentials live.** The GitHub access and refresh tokens are stored
