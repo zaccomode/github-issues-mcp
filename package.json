@@ -7,7 +7,12 @@
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "cf-typegen": "wrangler types",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "lint": "oxlint src/",
+    "format": "oxfmt src/",
+    "check": "npm run lint && npm run type-check",
+    "db:migrate": "wrangler d1 migrations apply github-issues-mcp --remote",
+    "db:migrate:local": "wrangler d1 migrations apply github-issues-mcp --local"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.8.2",
