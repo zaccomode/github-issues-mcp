@@ -218,7 +218,10 @@ async function complete(
 
 	const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
 		request: pending.authRequest,
-		userId: `gh:${user.id}:inst:${installation.id}`,
+		// No colons: the OAuth provider builds codes and tokens as
+		// `userId:grantId:secret` and parses them by splitting on ":", requiring
+		// exactly three parts. A colon here makes every code unredeemable.
+		userId: `gh-${user.id}-inst-${installation.id}`,
 		// Not encrypted by the library — deliberately identifiers only, so grants
 		// stay auditable and revocable without exposing anything sensitive. Never
 		// put a token here.
