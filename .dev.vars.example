@@ -1,0 +1,11 @@
+# Copy to .dev.vars and fill in from your *dev* GitHub App registration.
+# .dev.vars is gitignored; this example file is not.
+
+GITHUB_CLIENT_SECRET="..."
+GITHUB_WEBHOOK_SECRET="..."
+
+# Must be PKCS#8 — GitHub gives you PKCS#1, so convert it first:
+#   openssl pkcs8 -topk8 -inform PEM -outform PEM -nocrypt \
+#     -in app.private-key.pem -out app.pkcs8.pem
+# Newlines may be written as literal \n on a single line, as below.
+GITHUB_APP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIEv...\n-----END PRIVATE KEY-----\n"

@@ -1,17 +1,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { gh, GitHubError, seg } from "./github";
-import { compactComment, compactIssue, compactLabel } from "./shape";
+import { checkQuota, recordUsage } from "../db/usage";
+import { gh, seg } from "../github/client";
+import { compactComment, compactIssue, compactLabel } from "../shape";
+import { type ToolContext, actAs, explain, paging, repoPath, repoShape, scrub } from "./common";
 
 /**
- * Builds an MCP server bound to a single PAT. A fresh instance is created per
- * request, so the token lives only as long as the request that supplied it.
+ * Builds an MCP server bound to a single connection's credentials. A fresh
+ * instance is created per request, so the tokens live only as long as the
+ * request that supplied them.
  */
-export function createGitHubIssuesServer(pat: string, login: string): McpServer {
+export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 	const server = new McpServer({
 		name: "github-issues",
-		version: "1.0.0",
+		version: "2.0.0",
 	});
 
 	interface ToolConfig {
@@ -31,35 +34,24 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 		// being funnelled through one helper — the zod schemas above each handler
 		// remain the real contract, and they are what actually validate input.
 		(server.registerTool as any)(name, config, async (args: any): Promise<CallToolResult> => {
+			// Counted whether or not it succeeds: a failed call still costs a GitHub
+			// round trip. Deferred so metering never sits in the latency path.
+			ctx.waitUntil(recordUsage(ctx.env, ctx.tenant.installationId, "tool_call"));
+
 			try {
 				const data = await handler(args);
 				return {
 					structuredContent: data as Record<string, unknown>,
-					content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
+					content: [{ type: "text", text: scrub(JSON.stringify(data, null, 2)) }],
 				};
 			} catch (error) {
-				const message =
-					error instanceof GitHubError || error instanceof Error
-						? error.message
-						: String(error);
-				return { isError: true, content: [{ type: "text", text: message }] };
+				return {
+					isError: true,
+					content: [{ type: "text", text: scrub(explain(error, args, ctx.tenant)) }],
+				};
 			}
 		});
 	}
-
-	const repoShape = {
-		owner: z.string().describe("Repository owner — a user or organisation login"),
-		repo: z.string().describe("Repository name"),
-	};
-
-	const paging = {
-		per_page: z.number().int().min(1).max(100).default(30),
-		page: z.number().int().min(1).default(1),
-	};
-
-	/** Builds the `/repos/{owner}/{repo}` prefix with both segments escaped. */
-	const repoPath = (a: { owner: string; repo: string }) =>
-		`/repos/${seg(a.owner)}/${seg(a.repo)}`;
 
 	// ---------------------------------------------------------------- identity
 
@@ -68,16 +60,51 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 		{
 			annotations: { readOnlyHint: true },
 			description:
-				"Show which GitHub account the current token belongs to. Useful for confirming the connector is wired up correctly.",
+				"Show both GitHub identities this connection can act as — the app's bot account " +
+				"and the signed-in person — plus which repositories the app can reach. Useful " +
+				"for confirming the connector is wired up correctly and for deciding what to " +
+				"pass as act_as.",
 			inputSchema: {},
 		},
 		async () => {
-			const user = await gh<any>(pat, "/user");
+			// Reported side by side rather than as one call, because a half-broken
+			// connection is exactly when you most want this tool to still answer.
+			const [appSide, userSide, quota] = await Promise.allSettled([
+				gh<any>(ctx.creds.app, "/installation/repositories", { query: { per_page: 1 } }),
+				gh<any>(ctx.creds.user, "/user"),
+				checkQuota(ctx.env, ctx.tenant.installationId),
+			]);
+
 			return {
-				login: user.login,
-				name: user.name ?? undefined,
-				type: user.type,
-				authorised_as: login,
+				app:
+					appSide.status === "fulfilled"
+						? {
+								slug: ctx.tenant.appSlug,
+								bot_login: ctx.tenant.botLogin,
+								installation_id: ctx.tenant.installationId,
+								account: ctx.tenant.accountLogin,
+								account_type: ctx.tenant.accountType,
+								repositories_accessible: appSide.value.total_count,
+							}
+						: { error: scrub(String(appSide.reason?.message ?? appSide.reason)) },
+				user:
+					userSide.status === "fulfilled"
+						? {
+								login: userSide.value.login,
+								id: userSide.value.id,
+								name: userSide.value.name ?? undefined,
+								type: userSide.value.type,
+							}
+						: { error: scrub(String(userSide.reason?.message ?? userSide.reason)) },
+				default_write_identity: "app",
+				usage:
+					quota.status === "fulfilled"
+						? {
+								tool_calls_this_month: quota.value.used,
+								monthly_limit: quota.value.limit,
+								resets_at: quota.value.resetsAt,
+							}
+						: undefined,
 			};
 		},
 	);
@@ -120,7 +147,7 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 			},
 		},
 		async (a) => {
-			const raw = await gh<any[]>(pat, `${repoPath(a)}/issues`, {
+			const raw = await gh<any[]>(ctx.creds.user, `${repoPath(a)}/issues`, {
 				query: {
 					state: a.state,
 					labels: a.labels?.length ? a.labels.join(",") : undefined,
@@ -153,7 +180,8 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 				issue_number: z.number().int().positive(),
 			},
 		},
-		async (a) => compactIssue(await gh<any>(pat, `${repoPath(a)}/issues/${a.issue_number}`)),
+		async (a) =>
+			compactIssue(await gh<any>(ctx.creds.user, `${repoPath(a)}/issues/${a.issue_number}`)),
 	);
 
 	register(
@@ -161,7 +189,12 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 		{
 			annotations: { readOnlyHint: true },
 			description:
-				"Search issues and pull requests across GitHub using search syntax. Scope the query with qualifiers such as `repo:owner/name`, `is:open`, `label:bug`, or `author:login` — without them this searches all of GitHub. Note this endpoint has its own rate limit of 30 requests per minute.",
+				"Search issues and pull requests across GitHub using search syntax. Scope the " +
+				"query with qualifiers such as `repo:owner/name`, `is:open`, `label:bug`, or " +
+				"`author:login` — without them this searches all of GitHub. This runs as you " +
+				"rather than as the app, so it can surface issues in repositories the write " +
+				"tools cannot touch; use whoami to see where the app is actually installed. " +
+				"Note this endpoint has its own rate limit of 30 requests per minute.",
 			inputSchema: {
 				q: z
 					.string()
@@ -175,7 +208,7 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 			},
 		},
 		async (a) => {
-			const found = await gh<any>(pat, "/search/issues", {
+			const found = await gh<any>(ctx.creds.user, "/search/issues", {
 				query: {
 					q: a.q,
 					sort: a.sort,
@@ -210,11 +243,12 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 					.string()
 					.optional()
 					.describe("Issue type name, if the org has types enabled"),
+				...actAs,
 			},
 		},
 		async (a) =>
 			compactIssue(
-				await gh<any>(pat, `${repoPath(a)}/issues`, {
+				await gh<any>(ctx.creds.as(a.act_as), `${repoPath(a)}/issues`, {
 					method: "POST",
 					body: {
 						title: a.title,
@@ -256,11 +290,12 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 					.optional()
 					.describe("Milestone number, or null to clear it"),
 				type: z.string().nullable().optional(),
+				...actAs,
 			},
 		},
 		async (a) =>
 			compactIssue(
-				await gh<any>(pat, `${repoPath(a)}/issues/${a.issue_number}`, {
+				await gh<any>(ctx.creds.as(a.act_as), `${repoPath(a)}/issues/${a.issue_number}`, {
 					method: "PATCH",
 					body: {
 						title: a.title,
@@ -294,9 +329,11 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 			},
 		},
 		async (a) => {
-			const raw = await gh<any[]>(pat, `${repoPath(a)}/issues/${a.issue_number}/comments`, {
-				query: { since: a.since, per_page: a.per_page, page: a.page },
-			});
+			const raw = await gh<any[]>(
+				ctx.creds.user,
+				`${repoPath(a)}/issues/${a.issue_number}/comments`,
+				{ query: { since: a.since, per_page: a.per_page, page: a.page } },
+			);
 			return {
 				count: raw.length,
 				page: a.page,
@@ -314,14 +351,16 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 				...repoShape,
 				issue_number: z.number().int().positive(),
 				body: z.string().min(1).describe("Comment body in GitHub-flavoured Markdown"),
+				...actAs,
 			},
 		},
 		async (a) =>
 			compactComment(
-				await gh<any>(pat, `${repoPath(a)}/issues/${a.issue_number}/comments`, {
-					method: "POST",
-					body: { body: a.body },
-				}),
+				await gh<any>(
+					ctx.creds.as(a.act_as),
+					`${repoPath(a)}/issues/${a.issue_number}/comments`,
+					{ method: "POST", body: { body: a.body } },
+				),
 			),
 	);
 
@@ -330,19 +369,23 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 		{
 			annotations: { destructiveHint: true },
 			description:
-				"Edit an existing comment. Takes the comment's own id — from list_issue_comments — not the issue number.",
+				"Edit an existing comment. Takes the comment's own id — from list_issue_comments " +
+				"— not the issue number. You can only edit a comment the same identity wrote, so " +
+				"act_as must match whoever authored it.",
 			inputSchema: {
 				...repoShape,
 				comment_id: z.number().int().positive(),
 				body: z.string().min(1),
+				...actAs,
 			},
 		},
 		async (a) =>
 			compactComment(
-				await gh<any>(pat, `${repoPath(a)}/issues/comments/${a.comment_id}`, {
-					method: "PATCH",
-					body: { body: a.body },
-				}),
+				await gh<any>(
+					ctx.creds.as(a.act_as),
+					`${repoPath(a)}/issues/comments/${a.comment_id}`,
+					{ method: "PATCH", body: { body: a.body } },
+				),
 			),
 	);
 
@@ -357,7 +400,7 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 			inputSchema: { ...repoShape, ...paging },
 		},
 		async (a) => {
-			const raw = await gh<any[]>(pat, `${repoPath(a)}/labels`, {
+			const raw = await gh<any[]>(ctx.creds.user, `${repoPath(a)}/labels`, {
 				query: { per_page: a.per_page, page: a.page },
 			});
 			return { count: raw.length, labels: raw.map(compactLabel) };
@@ -373,13 +416,15 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 				...repoShape,
 				issue_number: z.number().int().positive(),
 				labels: z.array(z.string()).min(1),
+				...actAs,
 			},
 		},
 		async (a) => {
-			const raw = await gh<any[]>(pat, `${repoPath(a)}/issues/${a.issue_number}/labels`, {
-				method: "POST",
-				body: { labels: a.labels },
-			});
+			const raw = await gh<any[]>(
+				ctx.creds.as(a.act_as),
+				`${repoPath(a)}/issues/${a.issue_number}/labels`,
+				{ method: "POST", body: { labels: a.labels } },
+			);
 			return { labels: raw.map(compactLabel) };
 		},
 	);
@@ -393,11 +438,12 @@ export function createGitHubIssuesServer(pat: string, login: string): McpServer 
 				...repoShape,
 				issue_number: z.number().int().positive(),
 				label: z.string().min(1),
+				...actAs,
 			},
 		},
 		async (a) => {
 			const raw = await gh<any[]>(
-				pat,
+				ctx.creds.as(a.act_as),
 				`${repoPath(a)}/issues/${a.issue_number}/labels/${seg(a.label)}`,
 				{ method: "DELETE" },
 			);

@@ -3,32 +3,57 @@
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
 {
-	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "github-issues-mcp",
-	"main": "src/index.ts",
-	"compatibility_date": "2025-03-10",
-	"compatibility_flags": ["nodejs_compat"],
-	/**
-	 * Comma-separated GitHub logins permitted to use this server. The PAT is
-	 * checked against this list at /authorize via GET /user, and re-checked on
-	 * every MCP request. Not a secret — it is only an allowlist.
-	 */
-	"vars": {
-		"ALLOWED_LOGINS": "zaccomode",
-	},
-	/**
-	 * Grant and token storage for @cloudflare/workers-oauth-provider. The
-	 * binding must be named OAUTH_KV. Grant props (which hold the PAT) are
-	 * stored encrypted using the issued token as key material.
-	 */
-	"kv_namespaces": [
-		{
-			"binding": "OAUTH_KV",
-			"id": "c6e39a0931b64d6abd74650c99208cd7",
-		},
-	],
-	"observability": {
-		"enabled": true,
-	},
-	"upload_source_maps": true,
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "github-issues-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  /**
+   * None of these are secrets. The App id, slug and OAuth client id are all
+   * visible to anyone who reaches the install page; the private key and the
+   * client secret are Worker secrets and never appear here.
+   *
+   * PUBLIC_URL must match the GitHub App's registered callback URL exactly. It
+   * is what we hand GitHub as `redirect_uri`, deliberately in preference to
+   * anything derived from the inbound request's Host header.
+   */
+  "vars": {
+    "GITHUB_APP_ID": "4414803",
+    "GITHUB_APP_SLUG": "claude-issues-mcp",
+    "GITHUB_CLIENT_ID": "Iv23liYlQED7C7aqtDmm",
+    "PUBLIC_URL": "https://github-issues-mcp.zaccomode.workers.dev",
+    "DEFAULT_MONTHLY_QUOTA": "5000",
+  },
+  /**
+   * OAUTH_KV is the provider's own grant and token store; that binding name is
+   * fixed by @cloudflare/workers-oauth-provider. CACHE is ours — installation
+   * tokens, OAuth state nonces, and other short-lived lookups. Kept separate so
+   * that purging one never touches the other.
+   */
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "c6e39a0931b64d6abd74650c99208cd7",
+    },
+    {
+      "binding": "CACHE",
+      "id": "621b74efcabb4097ac0b291ed05fb55b",
+    },
+  ],
+  /**
+   * Tenant records, connection history, and usage counters. Deliberately holds
+   * no credentials — see the comment at the top of src/auth/crypto.ts.
+   */
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "github-issues-mcp",
+      "database_id": "8c963fb7-1da7-4dcb-8e7f-2b0286e6f0ca",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "observability": {
+    "enabled": true,
+  },
+  "upload_source_maps": true,
 }
