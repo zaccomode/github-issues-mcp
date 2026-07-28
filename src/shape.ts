@@ -33,6 +33,37 @@ export function compactIssue(issue: any) {
 	};
 }
 
+/**
+ * Pull requests carry everything an issue does plus the branch pair and merge
+ * state. `closes_issues` is not part of the REST payload — GitHub exposes the
+ * issue link only through GraphQL — so the tool layer folds it in separately.
+ */
+export function compactPullRequest(pr: any) {
+	return {
+		number: pr.number,
+		title: pr.title,
+		state: pr.state,
+		draft: pr.draft ?? undefined,
+		merged: pr.merged ?? undefined,
+		// Absent from list payloads; only the single-PR endpoint computes it.
+		mergeable_state: pr.mergeable_state ?? undefined,
+		head: pr.head?.label ?? pr.head?.ref,
+		base: pr.base?.ref,
+		labels: (pr.labels ?? []).map(labelName),
+		assignees: (pr.assignees ?? []).map((a: any) => a.login),
+		requested_reviewers: (pr.requested_reviewers ?? []).map((r: any) => r.login),
+		milestone: pr.milestone?.title ?? undefined,
+		author: pr.user?.login,
+		comments: pr.comments,
+		created_at: pr.created_at,
+		updated_at: pr.updated_at,
+		closed_at: pr.closed_at ?? undefined,
+		merged_at: pr.merged_at ?? undefined,
+		url: pr.html_url,
+		body: pr.body ?? undefined,
+	};
+}
+
 export function compactComment(comment: any) {
 	return {
 		id: comment.id,

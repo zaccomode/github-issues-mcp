@@ -2,9 +2,34 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { checkQuota, recordUsage } from "../db/usage";
-import { gh, seg } from "../github/client";
-import { compactComment, compactIssue, compactLabel } from "../shape";
-import { type ToolContext, actAs, explain, paging, repoPath, repoShape, scrub } from "./common";
+import { gh, ghGraphQL, seg } from "../github/client";
+import { compactComment, compactIssue, compactLabel, compactPullRequest } from "../shape";
+import {
+	type ToolContext,
+	actAs,
+	explain,
+	paging,
+	repoPath,
+	repoShape,
+	scrub,
+	withClosingKeywords,
+} from "./common";
+
+/**
+ * The only thing REST cannot tell us about a pull request. `closingIssuesReferences`
+ * is the read side of the link that closing keywords create.
+ */
+const CLOSING_ISSUES_QUERY = `
+	query ($owner: String!, $repo: String!, $number: Int!) {
+		repository(owner: $owner, name: $repo) {
+			pullRequest(number: $number) {
+				closingIssuesReferences(first: 50) {
+					nodes { number }
+				}
+			}
+		}
+	}
+`;
 
 /**
  * Builds an MCP server bound to a single connection's credentials. A fresh
@@ -309,6 +334,245 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 					},
 				}),
 			),
+	);
+
+	// ----------------------------------------------------------- pull requests
+
+	/**
+	 * Reads the issues a PR will close. Degrades to `undefined` rather than
+	 * failing the whole tool: a PR's own details are still worth returning when
+	 * the GraphQL half is unavailable, and the caller can tell "no links" (an
+	 * empty array) from "could not check" (the key being absent).
+	 */
+	async function closingIssues(a: any): Promise<number[] | undefined> {
+		try {
+			const result = await ghGraphQL<any>(ctx.creds.user, CLOSING_ISSUES_QUERY, {
+				owner: a.owner,
+				repo: a.repo,
+				number: a.pull_number,
+			});
+			const nodes = result.repository?.pullRequest?.closingIssuesReferences?.nodes ?? [];
+			return nodes.map((node: any) => node.number);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * The warning that catches the silent failure. GitHub parses closing keywords
+	 * only when the pull request targets the default branch; against any other
+	 * base it creates no link at all while still returning a perfectly successful
+	 * response. Without this, a tool result would report a link that isn't there.
+	 *
+	 * Costs one extra request, and only when linking was actually asked for.
+	 */
+	async function linkNotice(a: any, base: string | undefined): Promise<string | undefined> {
+		if (!a.closes?.length || !base) {
+			return undefined;
+		}
+
+		let defaultBranch: string | undefined;
+		try {
+			defaultBranch = (await gh<any>(ctx.creds.user, repoPath(a))).default_branch;
+		} catch {
+			// A failed check must never turn a write that already succeeded into
+			// an error. Silence is the right failure mode here.
+			return undefined;
+		}
+
+		if (!defaultBranch || base === defaultBranch) {
+			return undefined;
+		}
+
+		return (
+			`No issue link was created. GitHub interprets closing keywords only when a pull ` +
+			`request targets the default branch (${defaultBranch}), and this one targets ` +
+			`${base}. The keywords are in the body and will take effect if the base is ` +
+			`changed to ${defaultBranch}; until then the issues are not linked and merging ` +
+			`will not close them.`
+		);
+	}
+
+	register(
+		"list_pull_requests",
+		{
+			annotations: { readOnlyHint: true },
+			description: "List pull requests in a repository.",
+			inputSchema: {
+				...repoShape,
+				state: z.enum(["open", "closed", "all"]).default("open"),
+				head: z
+					.string()
+					.optional()
+					.describe("Filter by head branch, as 'owner:branch' for a fork"),
+				base: z.string().optional().describe("Filter by the branch being merged into"),
+				sort: z.enum(["created", "updated", "popularity", "long-running"]).default("created"),
+				direction: z.enum(["asc", "desc"]).default("desc"),
+				...paging,
+			},
+		},
+		async (a) => {
+			const raw = await gh<any[]>(ctx.creds.user, `${repoPath(a)}/pulls`, {
+				query: {
+					state: a.state,
+					head: a.head,
+					base: a.base,
+					sort: a.sort,
+					direction: a.direction,
+					per_page: a.per_page,
+					page: a.page,
+				},
+			});
+			return {
+				count: raw.length,
+				page: a.page,
+				pull_requests: raw.map(compactPullRequest),
+			};
+		},
+	);
+
+	register(
+		"get_pull_request",
+		{
+			annotations: { readOnlyHint: true },
+			description:
+				"Fetch a single pull request, including its body and the issues it will close. " +
+				"`closes_issues` is omitted entirely if the link could not be read, which is " +
+				"different from it being present and empty.",
+			inputSchema: {
+				...repoShape,
+				pull_number: z.number().int().positive(),
+			},
+		},
+		async (a) => {
+			const [pr, closes] = await Promise.all([
+				gh<any>(ctx.creds.user, `${repoPath(a)}/pulls/${a.pull_number}`),
+				closingIssues(a),
+			]);
+			return { ...compactPullRequest(pr), closes_issues: closes };
+		},
+	);
+
+	register(
+		"create_pull_request",
+		{
+			annotations: { destructiveHint: false },
+			description:
+				"Open a pull request for a branch that has already been pushed to GitHub. This " +
+				"server cannot push code — commit and push with git first, then call this. Use " +
+				"`closes` to link the pull request to the issues it resolves.",
+			inputSchema: {
+				...repoShape,
+				title: z.string().min(1),
+				head: z
+					.string()
+					.min(1)
+					.describe(
+						"The branch holding the changes. It must already exist on GitHub. Use " +
+							"'owner:branch' when the branch is on a fork.",
+					),
+				base: z.string().min(1).describe("The branch to merge into, e.g. 'main'"),
+				body: z.string().optional().describe("PR body in GitHub-flavoured Markdown"),
+				closes: z
+					.array(z.number().int().positive())
+					.optional()
+					.describe(
+						"Issue numbers this pull request resolves. Rendered into the body as " +
+							"GitHub closing keywords, which is the only mechanism that creates the " +
+							"link — GitHub has no API for it. The link is created ONLY when `base` " +
+							"is the repository's default branch; against any other base the " +
+							"keywords are ignored and the result will say so.",
+					),
+				draft: z.boolean().default(false),
+				maintainer_can_modify: z
+					.boolean()
+					.optional()
+					.describe("Whether maintainers can push to the head branch"),
+				...actAs,
+			},
+		},
+		async (a) => {
+			const pr = await gh<any>(ctx.creds.as(a.act_as), `${repoPath(a)}/pulls`, {
+				method: "POST",
+				body: {
+					title: a.title,
+					head: a.head,
+					base: a.base,
+					body: withClosingKeywords(a.body, a.closes),
+					draft: a.draft,
+					maintainer_can_modify: a.maintainer_can_modify,
+				},
+			});
+
+			return {
+				...compactPullRequest(pr),
+				link_warning: await linkNotice(a, a.base),
+			};
+		},
+	);
+
+	register(
+		"update_pull_request",
+		{
+			annotations: { destructiveHint: true },
+			description:
+				"Update an existing pull request, and the way to link issues to one that is " +
+				"already open. `closes` appends closing keywords to the body and is safe to " +
+				"repeat — an issue already linked is not added twice. Take care: `body` REPLACES " +
+				"the existing body. This is also how a pull request is closed, via `state`.",
+			inputSchema: {
+				...repoShape,
+				pull_number: z.number().int().positive(),
+				title: z.string().min(1).optional(),
+				body: z.string().optional().describe("REPLACES the existing body"),
+				state: z.enum(["open", "closed"]).optional(),
+				base: z.string().optional().describe("Retarget the pull request at another branch"),
+				closes: z
+					.array(z.number().int().positive())
+					.optional()
+					.describe(
+						"Issue numbers to link, appended to the body as closing keywords. Only " +
+							"takes effect when the pull request targets the default branch.",
+					),
+				...actAs,
+			},
+		},
+		async (a) => {
+			let body = a.body;
+			let base = a.base;
+
+			// Linking is read-modify-write on the body, so anything the caller did
+			// not supply has to be read back before it can be appended to.
+			if (a.closes?.length && (body === undefined || base === undefined)) {
+				const current = await gh<any>(
+					ctx.creds.user,
+					`${repoPath(a)}/pulls/${a.pull_number}`,
+				);
+				body = body ?? current.body ?? "";
+				base = base ?? current.base?.ref;
+			}
+
+			const pr = await gh<any>(
+				ctx.creds.as(a.act_as),
+				`${repoPath(a)}/pulls/${a.pull_number}`,
+				{
+					method: "PATCH",
+					body: {
+						title: a.title,
+						body: withClosingKeywords(body, a.closes),
+						state: a.state,
+						// Only ever the explicit value — `base` above may have been
+						// read back purely to decide whether to warn.
+						base: a.base,
+					},
+				},
+			);
+
+			return {
+				...compactPullRequest(pr),
+				link_warning: await linkNotice(a, base),
+			};
+		},
 	);
 
 	// ---------------------------------------------------------------- comments

@@ -76,6 +76,37 @@ export async function gh<T>(
 	return finish<T>(response, source);
 }
 
+/**
+ * Issues a GraphQL query as `source`.
+ *
+ * GraphQL is needed for the handful of things REST does not expose — currently
+ * only a pull request's linked issues. Note the failure mode differs from REST:
+ * GitHub answers a rejected query with **HTTP 200 and an `errors` array**, so
+ * `finish()` sees a success and returns normally. The same trap as GitHub's
+ * OAuth token endpoint; see the note in src/auth/user-oauth.ts.
+ */
+export async function ghGraphQL<T>(
+	source: TokenSource,
+	query: string,
+	variables: Record<string, unknown> = {},
+): Promise<T> {
+	const payload = await gh<{ data?: T; errors?: { message?: string }[] }>(source, "/graphql", {
+		method: "POST",
+		body: { query, variables },
+	});
+
+	if (payload?.errors?.length) {
+		const detail = payload.errors.map((e) => e.message ?? "unknown error").join(" — ");
+		throw new GitHubError(200, `GitHub rejected the GraphQL query. ${detail}`);
+	}
+
+	if (!payload?.data) {
+		throw new GitHubError(200, "GitHub's GraphQL API returned no data.");
+	}
+
+	return payload.data;
+}
+
 /** A single unauthenticated-by-source request, for callers holding a raw token. */
 export async function ghRaw<T>(
 	token: string,

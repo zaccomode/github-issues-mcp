@@ -1,7 +1,8 @@
 /**
  * Shared pieces of the tool layer: the per-request context, the argument shapes
- * every tool reuses, and the two functions that turn a GitHub failure into
- * something a model can actually act on.
+ * every tool reuses, the closing-keyword rendering that links pull requests to
+ * issues, and the two functions that turn a GitHub failure into something a
+ * model can actually act on.
  */
 
 import { z } from "zod";
@@ -58,6 +59,49 @@ export const actAs = {
 export const repoPath = (a: { owner: string; repo: string }) =>
 	`/repos/${seg(a.owner)}/${seg(a.repo)}`;
 
+// ------------------------------------------------------- issue links on a PR
+
+/**
+ * GitHub has no API for linking a pull request to an issue — not in REST, not
+ * as a GraphQL mutation. The link exists only as a side effect of GitHub
+ * parsing a closing keyword out of the PR *body*, and only when the PR targets
+ * the repository's default branch.
+ *
+ * So the linking feature is really body authoring, and this is all of it. The
+ * pattern matches every form GitHub accepts (close/closes/closed, fix/fixes/
+ * fixed, resolve/resolves/resolved, any case, optional colon) so that we can
+ * recognise a link the model wrote by hand and avoid duplicating it.
+ */
+const CLOSING_KEYWORD = "(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)";
+
+/** Whether `body` already closes `issue`, in any of the accepted spellings. */
+export function linksIssue(body: string, issue: number): boolean {
+	return new RegExp(`\\b${CLOSING_KEYWORD}\\b\\s*:?\\s+#${issue}\\b`, "i").test(body);
+}
+
+/**
+ * Appends `Closes #n` for each issue not already linked. Returns `body`
+ * unchanged when there is nothing to add, which keeps a repeated call a no-op
+ * rather than a body that accretes a duplicate line every time.
+ */
+export function withClosingKeywords(
+	body: string | undefined,
+	closes: number[] | undefined,
+): string | undefined {
+	if (!closes?.length) {
+		return body;
+	}
+
+	const existing = body ?? "";
+	const missing = closes.filter((issue) => !linksIssue(existing, issue));
+	if (missing.length === 0) {
+		return body;
+	}
+
+	const added = missing.map((issue) => `Closes #${issue}`).join("\n");
+	return existing.trim() ? `${existing.trimEnd()}\n\n${added}\n` : `${added}\n`;
+}
+
 /**
  * Adds the context that turns a bare GitHub status into a next action.
  *
@@ -73,12 +117,25 @@ export function explain(error: unknown, args: any, tenant: Tenant): string {
 
 	const actor: "app" | "user" = args?.act_as === "user" ? "user" : "app";
 	const target = args?.owner && args?.repo ? `${args.owner}/${args.repo}` : "that repository";
+	// Only the pull request tools take these, and they are what distinguish a
+	// PR failure from an issue one — which matters because the two have
+	// different likely causes at the same status code.
+	const isPullRequest = args?.head !== undefined || args?.pull_number !== undefined;
 
 	switch (error.status) {
 		case 410:
 			return base;
 
 		case 422:
+			if (args?.head) {
+				return (
+					`${base}\n\nCreating a pull request fails with 422 for three common ` +
+					`reasons: the head branch \`${args.head}\` has not been pushed to GitHub ` +
+					`yet (this server cannot push — commit and push with git first), there ` +
+					`are no commits between \`${args.base}\` and \`${args.head}\`, or an open ` +
+					`pull request for that branch already exists.`
+				);
+			}
 			if (actor === "app" && args?.assignees?.length) {
 				return (
 					`${base}\n\nThis ran as the app's bot account. Bot accounts cannot be issue ` +
@@ -110,6 +167,16 @@ export function explain(error: unknown, args: any, tenant: Tenant): string {
 					`${base}\n\nThat was your personal limit, which is shared across every GitHub ` +
 					`App acting on your behalf. Retrying with act_as: "app" uses the ` +
 					`installation's separate limit.`
+				);
+			}
+			if (actor === "app" && isPullRequest) {
+				return (
+					`${base}\n\nPull request tools need the app's "Pull requests" permission at ` +
+					`read & write. Granting it in the App's settings is not enough on its own — ` +
+					`GitHub does not apply updated permissions retroactively, so the owner of ` +
+					`the installation on ${tenant.accountLogin} must approve the update before ` +
+					`its tokens carry it. Check for a pending approval at ` +
+					`https://github.com/settings/installations.`
 				);
 			}
 			return base;

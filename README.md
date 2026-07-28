@@ -18,12 +18,39 @@ without you editing a config file.
 
 `whoami`, `list_issues`, `get_issue`, `search_issues`, `create_issue`,
 `update_issue`, `list_issue_comments`, `add_issue_comment`,
-`update_issue_comment`, `list_labels`, `add_issue_labels`, `remove_issue_label`.
+`update_issue_comment`, `list_labels`, `add_issue_labels`, `remove_issue_label`,
+`list_pull_requests`, `get_pull_request`, `create_pull_request`,
+`update_pull_request`.
 
-The six write tools accept `act_as`. Reads always run as the signed-in person, so
-what an agent can see matches what you can see — which does mean `search_issues`
-can surface issues in repositories the write tools cannot touch. `whoami` reports
-both identities and where the App is actually installed.
+The eight write tools accept `act_as`. Reads always run as the signed-in person,
+so what an agent can see matches what you can see — which does mean
+`search_issues` can surface issues in repositories the write tools cannot touch.
+`whoami` reports both identities and where the App is actually installed.
+
+Because GitHub's REST API treats pull requests as issues, the issue tools also
+work on a PR number: `add_issue_comment` posts to the PR conversation, and the
+label tools apply to it.
+
+### Linking a pull request to an issue
+
+`create_pull_request` and `update_pull_request` take a `closes: [12, 13]`
+argument, and this is worth understanding rather than trusting.
+
+GitHub has **no API for linking a PR to an issue** — not in REST, not as a
+GraphQL mutation. The link exists only as a side effect of GitHub parsing a
+closing keyword (`Closes #12`) out of the PR body, and only when the PR targets
+the repository's default branch. So `closes` renders those keywords into the
+body for you, which removes two ways an agent gets this wrong: inventing a
+phrasing GitHub does not recognise (`Related to #12` creates nothing), and not
+knowing that a PR based on anything but the default branch is linked to nothing
+at all. In that second case the tool result carries a `link_warning` saying so,
+because GitHub itself reports a perfectly successful PR either way.
+
+`closes` is idempotent — an issue already linked, including by a keyword written
+by hand, is not added twice.
+
+The server cannot push code: it has no `Contents` permission by design. Commit
+and push a branch with git first, then open the PR for it.
 
 ## How a connection is made
 
@@ -51,7 +78,7 @@ forgeable, so it is only ever used as a hint and cross-checked against
 | Expire user authorization tokens | **on** |
 | Setup URL | leave blank |
 | Webhook URL | `https://<your-host>/webhooks/github` |
-| Repository permissions | Issues: **read & write**; Metadata: **read-only**; Pull requests: read-only |
+| Repository permissions | Issues: **read & write**; Pull requests: **read & write**; Metadata: **read-only** |
 | Where can this be installed | **Any account** |
 
 Then generate a private key and convert it, because WebCrypto cannot import the
@@ -147,6 +174,17 @@ the `quotas` table are the seam one would attach to.
 **Rate limits** differ by identity, which is worth knowing when choosing
 `act_as`: an installation gets its own 5,000–12,500/hour, while a user's 5,000
 per hour is shared across every GitHub App acting on their behalf.
+
+**No `Contents` permission.** Merging a PR and creating a branch both need
+`Contents: write`, so neither is offered. The server opens and annotates pull
+requests; it never writes code or merges anything. That is a deliberate ceiling
+on what a tenant is agreeing to when they install the App.
+
+**Changing permissions is not retroactive.** If you add a repository permission
+after people have installed the App, every existing installation keeps the old
+permission set until its owner approves the update — tokens do not silently gain
+the new access. The 403 you get in the meantime is explained as such by the tool
+layer rather than passed through raw.
 
 **Known limitation.** App bot accounts cannot be issue assignees. Assigning a
 person works under either `act_as`; assigning the bot itself is not possible at
