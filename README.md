@@ -1,18 +1,12 @@
 # github-issues-mcp
 
-A remote MCP server for GitHub issues, built as a **GitHub App** so that an
-agent's changes are attributable.
+A remote, Cloudflare Workers-based MCP server to manage GitHub issues, deployed as a GitHub app so that an agent's changes are attributable.
 
-Every write tool takes an `act_as` argument:
+This MCP server exists because the official GitHub MCP server must be run locally to connect to Claude Desktop, thus preventing it from properly working with Claude's cloud agent functionality. This works anywhere an MCP server is accepted, without all the fiddling the official one currently requires.
 
-- `act_as: "app"` (the default) posts as the App's bot account, so a comment an
-  agent left reads as `your-app[bot]` and is obviously not you.
-- `act_as: "user"` posts as the person who authorised the connection, badged as
-  coming via the App.
-
-That distinction is the point of the server. It also means no personal access
-token is involved anywhere, and that anyone can connect their own GitHub account
-without you editing a config file.
+> **This is an app you can install yourself!** I'm hosting a public version here that you can install to your account without having to host it yourself, giving you 5,000 requests an hour.
+>
+> https://github.com/apps/claude-issues-mcp
 
 ## Tools
 
@@ -31,39 +25,18 @@ Because GitHub's REST API treats pull requests as issues, the issue tools also
 work on a PR number: `add_issue_comment` posts to the PR conversation, and the
 label tools apply to it.
 
-### Linking a pull request to an issue
+### Acting
 
-`create_pull_request` and `update_pull_request` take a `closes: [12, 13]`
-argument, and this is worth understanding rather than trusting.
+Every write tool accepts `act_as`:
 
-GitHub has **no API for linking a PR to an issue** — not in REST, not as a
-GraphQL mutation. The link exists only as a side effect of GitHub parsing a
-closing keyword (`Closes #12`) out of the PR body, and only when the PR targets
-the repository's default branch. So `closes` renders those keywords into the
-body for you, which removes two ways an agent gets this wrong: inventing a
-phrasing GitHub does not recognise (`Related to #12` creates nothing), and not
-knowing that a PR based on anything but the default branch is linked to nothing
-at all. In that second case the tool result carries a `link_warning` saying so,
-because GitHub itself reports a perfectly successful PR either way.
+- `act_as: "app"` (default) posts as the app's bot account, so that PRs, comments and issues created by your agents are marked as such and not you.
+- `act_as: "user"` posts as the person who authorised the connection, badged as coming via the app.
 
-`closes` is idempotent — an issue already linked, including by a keyword written
-by hand, is not added twice.
+### Linking Pull Requests to Issues
 
-The server cannot push code: it has no `Contents` permission by design. Commit
-and push a branch with git first, then open the PR for it.
+`create_pull_request` and `update_pull_request` take a `closes: [12, 13]` argument, which appends the text "Closes #12, #13", etc. to the PR body such that it correctly links to issues you're working on.
 
-## How a connection is made
-
-1. An MCP client discovers `/authorize` and shows a consent screen naming itself.
-2. The browser goes to GitHub for the user-to-server OAuth handshake.
-3. We list the App installations that user can actually reach. If there are
-   none, they are sent to install it; if there are several, they pick one.
-4. The grant is bound to exactly one installation. Nothing a tool can pass
-   changes which installation its writes go to.
-
-GitHub puts an `installation_id` on the post-install redirect, but it is
-forgeable, so it is only ever used as a hint and cross-checked against
-`GET /user/installations` for the token just minted.
+This exists because GitHub has no API for linking PRs to issues, but does this implicitly when it detects a closing keywork in the PR body.
 
 ## Setting it up
 
@@ -71,15 +44,15 @@ forgeable, so it is only ever used as a hint and cross-checked against
 
 <https://github.com/settings/apps/new>
 
-| Setting | Value |
-| --- | --- |
-| Callback URL | `https://<your-host>/callback` |
-| Request user authorization (OAuth) during installation | **on** |
-| Expire user authorization tokens | **on** |
-| Setup URL | leave blank |
-| Webhook URL | `https://<your-host>/webhooks/github` |
-| Repository permissions | Issues: **read & write**; Pull requests: **read & write**; Metadata: **read-only** |
-| Where can this be installed | **Any account** |
+| Setting                                                | Value                                                                              |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| Callback URL                                           | `https://<your-host>/callback`                                                     |
+| Request user authorization (OAuth) during installation | **on**                                                                             |
+| Expire user authorization tokens                       | **on**                                                                             |
+| Setup URL                                              | leave blank                                                                        |
+| Webhook URL                                            | `https://<your-host>/webhooks/github`                                              |
+| Repository permissions                                 | Issues: **read & write**; Pull requests: **read & write**; Metadata: **read-only** |
+| Where can this be installed                            | **Any account**                                                                    |
 
 Then generate a private key and convert it, because WebCrypto cannot import the
 PKCS#1 key GitHub hands you:
@@ -135,7 +108,7 @@ npm run db:migrate:local
 npm run dev
 ```
 
-You do not need a tunnel for the OAuth flow: GitHub redirects the *browser* to
+You do not need a tunnel for the OAuth flow: GitHub redirects the _browser_ to
 the callback, it never calls your server. A tunnel is only needed to receive
 webhooks.
 
@@ -143,21 +116,16 @@ webhooks.
 npm run check   # lint + type-check
 ```
 
-[TESTING.md](./TESTING.md) is the runbook for proving it actually works —
-what has already been verified, what hasn't, and the order to test in.
+[TESTING.md](./TESTING.md) is the runbook for proving it actually works by what has already been verified, what hasn't, and the order to test in.
 
 ## Design notes
 
-**Where the credentials live.** The GitHub access and refresh tokens are stored
-in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts
-using the issued MCP token as key material — they cannot be recovered from KV
-without a live token. D1 holds tenant records, connection history and usage
-counters, and deliberately holds no credentials at all.
+**Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
 
 **Why refresh only happens in `tokenExchangeCallback`.** Using a GitHub refresh
 token invalidates the previous pair, and an API request has no way to write
 `props` back. Refreshing lazily on a 401 would therefore spend the refresh token,
-use the replacement once, and throw it away — bricking the grant. Instead the MCP
+use the replacement once, and throw it away, bricking the grant. Instead the MCP
 access token is given a 1-hour TTL, comfortably shorter than GitHub's 8 hours, so
 the MCP token always expires first and every refresh flows through the one place
 that can persist the result.
@@ -168,7 +136,7 @@ would make that budget the ceiling for the whole service.
 
 **Metering** counts tool calls per installation per month, deferred through
 `waitUntil` so it never sits in the latency path, and enforced before any GitHub
-request happens. There is no billing integration — `DEFAULT_MONTHLY_QUOTA` and
+request happens. There is no billing integration: `DEFAULT_MONTHLY_QUOTA` and
 the `quotas` table are the seam one would attach to.
 
 **Rate limits** differ by identity, which is worth knowing when choosing

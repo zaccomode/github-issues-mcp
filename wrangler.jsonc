@@ -9,10 +9,6 @@
   "compatibility_date": "2025-11-01",
   "compatibility_flags": ["nodejs_compat"],
   /**
-   * None of these are secrets. The App id, slug and OAuth client id are all
-   * visible to anyone who reaches the install page; the private key and the
-   * client secret are Worker secrets and never appear here.
-   *
    * PUBLIC_URL must match the GitHub App's registered callback URL exactly. It
    * is what we hand GitHub as `redirect_uri`, deliberately in preference to
    * anything derived from the inbound request's Host header.
