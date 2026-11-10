@@ -5,15 +5,18 @@ import { checkQuota, recordUsage } from "../db/usage";
 import { gh, ghGraphQL, seg } from "../github/client";
 import { compactComment, compactIssue, compactLabel, compactPullRequest } from "../shape";
 import {
+	type ToolConfig,
 	type ToolContext,
 	actAs,
 	explain,
 	paging,
+	ranAs,
 	repoPath,
 	repoShape,
 	scrub,
 	withClosingKeywords,
 } from "./common";
+import { registerSecurityTools } from "./security";
 
 /**
  * The only thing REST cannot tell us about a pull request. `closingIssuesReferences`
@@ -42,17 +45,6 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 		version: "2.0.0",
 	});
 
-	interface ToolConfig {
-		description: string;
-		inputSchema: z.ZodRawShape;
-		annotations?: {
-			readOnlyHint?: boolean;
-			destructiveHint?: boolean;
-			idempotentHint?: boolean;
-			openWorldHint?: boolean;
-		};
-	}
-
 	/** Wraps a handler so GitHub failures surface as tool errors, not exceptions. */
 	function register(name: string, config: ToolConfig, handler: (args: any) => Promise<unknown>) {
 		// `registerTool` is generic over its schema shape, which does not survive
@@ -70,10 +62,9 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 					content: [{ type: "text", text: scrub(JSON.stringify(data, null, 2)) }],
 				};
 			} catch (error) {
-				return {
-					isError: true,
-					content: [{ type: "text", text: scrub(explain(error, args, ctx.tenant)) }],
-				};
+				const identity = ranAs(config.inputSchema, args);
+				const text = scrub(explain(error, args, ctx.tenant, name, identity));
+				return { isError: true, content: [{ type: "text", text }] };
 			}
 		});
 	}
@@ -406,7 +397,9 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 					.optional()
 					.describe("Filter by head branch, as 'owner:branch' for a fork"),
 				base: z.string().optional().describe("Filter by the branch being merged into"),
-				sort: z.enum(["created", "updated", "popularity", "long-running"]).default("created"),
+				sort: z
+					.enum(["created", "updated", "popularity", "long-running"])
+					.default("created"),
 				direction: z.enum(["asc", "desc"]).default("desc"),
 				...paging,
 			},
@@ -714,6 +707,10 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 			return { labels: (raw ?? []).map(compactLabel) };
 		},
 	);
+
+	// ---------------------------------------------------------------- security
+
+	registerSecurityTools(register, ctx);
 
 	return server;
 }
