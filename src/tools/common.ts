@@ -198,6 +198,41 @@ export function withClosingKeywords(
 	return existing.trim() ? `${existing.trimEnd()}\n\n${added}\n` : `${added}\n`;
 }
 
+/** Which identity a tool call ran as, and whether the tool let the caller choose. */
+export interface RanAs {
+	actor: "app" | "user";
+	/** True for the write tools, which take `act_as`; reads always run as the user. */
+	switchable: boolean;
+}
+
+/**
+ * Works out a call's identity from the tool's own schema. Reads have no
+ * `act_as` and always run as the signed-in person, so a missing `act_as` means
+ * "user" for them — reading it as the "app" default, as a write would, sends
+ * the model after an App installation fix for what is really a user-side
+ * failure, and suggests an `act_as` the tool does not accept.
+ */
+export function ranAs(schema: z.ZodRawShape, args: any): RanAs {
+	if (!("act_as" in schema)) {
+		return { actor: "user", switchable: false };
+	}
+	return { actor: args?.act_as === "user" ? "user" : "app", switchable: true };
+}
+
+/**
+ * A token acting for a person through an App reaches only what that person can
+ * see AND what an installation of the App covers, so a private repository
+ * outside every installation answers 404 even to someone with full access.
+ */
+function userCannotSee(target: string, tenant: Tenant): string {
+	return (
+		`A request made for @${tenant.login} through the App reaches only repositories that ` +
+		`@${tenant.login} can see and, for private ones, that the App has been granted access ` +
+		`to. So either @${tenant.login} cannot see ${target}, or the App's installation does ` +
+		`not include it — add it at https://github.com/settings/installations.`
+	);
+}
+
 /**
  * Adds the context that turns a bare GitHub status into a next action.
  *
@@ -205,18 +240,24 @@ export function withClosingKeywords(
  * cannot know whether a 422 involved assignees or which identity the caller
  * asked for. That knowledge only exists here.
  */
-export function explain(error: unknown, args: any, tenant: Tenant, tool?: string): string {
+export function explain(
+	error: unknown,
+	args: any,
+	tenant: Tenant,
+	tool: string,
+	identity: RanAs,
+): string {
 	const base = error instanceof Error ? error.message : String(error);
 	if (!(error instanceof GitHubError)) {
 		return base;
 	}
 
-	const feature = tool ? securityFeatureOf(tool) : undefined;
+	const feature = securityFeatureOf(tool);
 	if (feature) {
 		return explainSecurity(error, base, feature, args, tenant);
 	}
 
-	const actor: "app" | "user" = args?.act_as === "user" ? "user" : "app";
+	const { actor, switchable } = identity;
 	const target = args?.owner && args?.repo ? `${args.owner}/${args.repo}` : "that repository";
 	// Only the pull request tools take these, and they are what distinguish a
 	// PR failure from an issue one — which matters because the two have
@@ -257,20 +298,21 @@ export function explain(error: unknown, args: any, tenant: Tenant, tool?: string
 					`you personally have access.`
 				);
 			}
-			return (
-				`${base}\n\nThis ran as @${tenant.login}, so it means that account cannot see ` +
-				`${target}.`
-			);
+			return `${base}\n\n${userCannotSee(target, tenant)}`;
 
 		case 403:
 			if (actor === "user" && /rate limit/i.test(base)) {
 				return (
 					`${base}\n\nThat was your personal limit, which is shared across every GitHub ` +
-					`App acting on your behalf. Retrying with act_as: "app" uses the ` +
-					`installation's separate limit.`
+					`App acting on your behalf. ` +
+					(switchable
+						? `Retrying with act_as: "app" uses the installation's separate limit.`
+						: `Read tools always run as you, so wait for the reset.`)
 				);
 			}
-			if (actor === "app" && isPullRequest) {
+			// Not only the app: a token acting for a person through the App is
+			// capped at the App's permissions too, so reads hit this as well.
+			if (isPullRequest) {
 				return (
 					`${base}\n\nPull request tools need the app's "Pull requests" permission at ` +
 					`read & write. Granting it in the App's settings is not enough on its own — ` +
@@ -410,8 +452,8 @@ function explainSecurity(
 
 	if (error.status === 404) {
 		return (
-			`${base}\n\nEither ${target} or the item does not exist, or @${tenant.login} ` +
-			`cannot see it. ${access}`
+			`${base}\n\nIf ${target} and the item do exist: ${userCannotSee(target, tenant)} ` +
+			`${access}`
 		);
 	}
 

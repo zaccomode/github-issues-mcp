@@ -10,6 +10,7 @@ import {
 	actAs,
 	explain,
 	paging,
+	ranAs,
 	repoPath,
 	repoShape,
 	scrub,
@@ -61,12 +62,9 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 					content: [{ type: "text", text: scrub(JSON.stringify(data, null, 2)) }],
 				};
 			} catch (error) {
-				return {
-					isError: true,
-					content: [
-						{ type: "text", text: scrub(explain(error, args, ctx.tenant, name)) },
-					],
-				};
+				const identity = ranAs(config.inputSchema, args);
+				const text = scrub(explain(error, args, ctx.tenant, name, identity));
+				return { isError: true, content: [{ type: "text", text }] };
 			}
 		});
 	}
