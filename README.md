@@ -16,6 +16,11 @@ This MCP server exists because the official GitHub MCP server must be run locall
 `list_pull_requests`, `get_pull_request`, `create_pull_request`,
 `update_pull_request`.
 
+Security (read-only): `list_dependabot_alerts`, `get_dependabot_alert`,
+`list_code_scanning_alerts`, `get_code_scanning_alert`,
+`list_secret_scanning_alerts`, `get_secret_scanning_alert`,
+`list_security_advisories`, `get_security_advisory`.
+
 The eight write tools accept `act_as`. Reads always run as the signed-in person,
 so what an agent can see matches what you can see — which does mean
 `search_issues` can surface issues in repositories the write tools cannot touch.
@@ -38,6 +43,31 @@ Every write tool accepts `act_as`:
 
 This exists because GitHub has no API for linking PRs to issues, but does this implicitly when it detects a closing keywork in the PR body.
 
+### Security Alerts
+
+The security tools read a repository's Dependabot alerts, code scanning alerts,
+secret scanning alerts and security advisories. Privately reported
+vulnerabilities arrive as advisories in the `triage` state, marked
+`reported_privately: true`.
+
+- **Read-only.** Dismissing alerts and accepting, closing or publishing
+  advisories are left to a person in GitHub's UI.
+- **Secret values are never returned.** Secret scanning is asked to hide them,
+  and the result is built from an allowlist of fields that does not include the
+  secret, so it cannot leak even if GitHub sends it anyway.
+- **Untrusted text is labelled.** Advisory descriptions are written by outside
+  reporters, and analysis messages can quote code from any contributor. Results
+  name these fields in `untrusted_fields` so an agent treats them as data, not
+  instructions.
+- **Lists page by cursor.** Pass a result's `next_cursor` back as `cursor` to
+  fetch the next page.
+
+They need extra App permissions (see [Setting it up](#setting-it-up)), and the
+person signed in must be able to see the alerts on GitHub themselves, which
+usually means write access or above. Code scanning and secret scanning must also be turned on for the
+repository; on private repositories they need GitHub Code Security and Secret
+Protection. Each of these failures gets its own explanation in the tool error.
+
 ## Setting it up
 
 ### 1. Register a GitHub App
@@ -53,6 +83,11 @@ This exists because GitHub has no API for linking PRs to issues, but does this i
 | Webhook URL                                            | `https://<your-host>/webhooks/github`                                              |
 | Repository permissions                                 | Issues: **read & write**; Pull requests: **read & write**; Metadata: **read-only** |
 | Where can this be installed                            | **Any account**                                                                    |
+
+The security tools also need these repository permissions at **read-only**:
+Dependabot alerts, Code scanning alerts, Secret scanning alerts, and Repository
+security advisories. Without them those tools fail with an explanation and
+everything else works as before.
 
 Then generate a private key and convert it, because WebCrypto cannot import the
 PKCS#1 key GitHub hands you:

@@ -63,17 +63,40 @@ export async function gh<T>(
 	path: string,
 	options: RequestOptions = {},
 ): Promise<T> {
+	return finish<T>(await authed(source, path, options), source);
+}
+
+/**
+ * `gh()` for list endpoints that paginate by cursor. The cursor for the next
+ * page exists only in the `Link` response header, which `gh()` discards, so
+ * this hands the header back alongside the body for the caller to parse.
+ */
+export async function ghPaged<T>(
+	source: TokenSource,
+	path: string,
+	options: RequestOptions = {},
+): Promise<{ data: T; link: string | null }> {
+	const response = await authed(source, path, options);
+	const data = await finish<T>(response, source);
+	return { data, link: response.headers.get("link") };
+}
+
+/** Sends the request, retrying once with a renewed token on a 401. */
+async function authed(
+	source: TokenSource,
+	path: string,
+	options: RequestOptions,
+): Promise<Response> {
 	const response = await send(await source.token(), path, options);
 
 	if (response.status === 401) {
 		const renewed = await source.renew();
 		if (renewed) {
-			const retry = await send(renewed, path, options);
-			return finish<T>(retry, source);
+			return send(renewed, path, options);
 		}
 	}
 
-	return finish<T>(response, source);
+	return response;
 }
 
 /**
@@ -170,6 +193,14 @@ async function finish<T>(response: Response, source: TokenSource | undefined): P
 	return (await response.json()) as T;
 }
 
+/**
+ * The likely cause of a 422 from the issue and pull request tools. Exported so
+ * that `explain()` can swap it out for tools where it would mislead, such as
+ * the security alert tools, which have no labels or assignees.
+ */
+export const ISSUE_422_HINT =
+	"This usually means a label, assignee, milestone, or issue type does not exist in the repository.";
+
 /** Path segments come from tool arguments, so they must always be escaped. */
 export function seg(value: string): string {
 	return encodeURIComponent(value);
@@ -223,9 +254,7 @@ async function toGitHubError(
 		case 422:
 			return new GitHubError(
 				422,
-				`GitHub rejected the request as invalid (422). This usually means a label, ` +
-					`assignee, milestone, or issue type does not exist in the repository.${ran} ` +
-					`${detail}`,
+				`GitHub rejected the request as invalid (422). ${ISSUE_422_HINT}${ran} ${detail}`,
 			);
 
 		default:

@@ -1,12 +1,14 @@
 /**
  * Shared pieces of the tool layer: the per-request context, the argument shapes
- * every tool reuses, the closing-keyword rendering that links pull requests to
- * issues, and the two functions that turn a GitHub failure into something a
- * model can actually act on.
+ * every tool reuses, cursor paging, the closing-keyword rendering that links
+ * pull requests to issues, and the functions that turn a GitHub failure into
+ * something a model can actually act on — including the security tools' own
+ * three-way split between a missing permission, missing access, and a feature
+ * that is switched off.
  */
 
 import { z } from "zod";
-import { GitHubError, seg } from "../github/client";
+import { GitHubError, ISSUE_422_HINT, seg } from "../github/client";
 import type { Credentials } from "../github/credentials";
 import type { AppEnv } from "../env";
 
@@ -28,6 +30,24 @@ export interface ToolContext {
 	waitUntil: (promise: Promise<unknown>) => void;
 }
 
+export interface ToolConfig {
+	description: string;
+	inputSchema: z.ZodRawShape;
+	annotations?: {
+		readOnlyHint?: boolean;
+		destructiveHint?: boolean;
+		idempotentHint?: boolean;
+		openWorldHint?: boolean;
+	};
+}
+
+/** The server's tool registration helper, handed to modules that add tools. */
+export type Register = (
+	name: string,
+	config: ToolConfig,
+	handler: (args: any) => Promise<unknown>,
+) => void;
+
 export const repoShape = {
 	owner: z.string().describe("Repository owner — a user or organisation login"),
 	repo: z.string().describe("Repository name"),
@@ -37,6 +57,82 @@ export const paging = {
 	per_page: z.number().int().min(1).max(100).default(30),
 	page: z.number().int().min(1).default(1),
 };
+
+/**
+ * Paging for endpoints that page by cursor rather than page number. Some
+ * (Dependabot alerts, security advisories) accept only a cursor, and the rest
+ * accept both, so every security list tool takes this shape for consistency.
+ */
+export const cursorPaging = {
+	per_page: z.number().int().min(1).max(100).default(30),
+	cursor: z
+		.string()
+		.optional()
+		.describe(
+			"Omit for the first page. To fetch the next one, pass `next_cursor` from the " +
+				"previous result exactly as given. A result with no `next_cursor` is the last page.",
+		),
+};
+
+/**
+ * Reads the next page's position out of a `Link` header and returns it as an
+ * opaque cursor. GitHub writes it as `after=…` on cursor-paged endpoints and
+ * `page=…` on the rest, and an endpoint that supports both may use either, so
+ * the cursor records which one it was rather than the caller having to know.
+ */
+export function nextCursor(link: string | null | undefined): string | undefined {
+	if (!link) {
+		return undefined;
+	}
+
+	for (const [, target, rel] of link.matchAll(/<([^>]*)>\s*;\s*rel="([^"]*)"/g)) {
+		if (!rel.split(/\s+/).includes("next")) {
+			continue;
+		}
+
+		let url: URL;
+		try {
+			url = new URL(target);
+		} catch {
+			return undefined;
+		}
+
+		const after = url.searchParams.get("after");
+		if (after) {
+			return `after:${after}`;
+		}
+		const page = url.searchParams.get("page");
+		if (page && /^\d+$/.test(page)) {
+			return `page:${page}`;
+		}
+		return undefined;
+	}
+
+	return undefined;
+}
+
+/** Turns a cursor from `nextCursor()` back into the query parameter it came from. */
+export function cursorQuery(cursor: string | undefined): { after?: string; page?: number } {
+	if (!cursor) {
+		return {};
+	}
+
+	const split = cursor.indexOf(":");
+	const kind = cursor.slice(0, split);
+	const value = cursor.slice(split + 1);
+
+	if (split > 0 && kind === "after" && value) {
+		return { after: value };
+	}
+	if (split > 0 && kind === "page" && /^\d+$/.test(value)) {
+		return { page: Number(value) };
+	}
+
+	throw new Error(
+		`Unrecognised cursor "${cursor}". Pass next_cursor exactly as a previous result ` +
+			`returned it, or omit cursor to start from the first page.`,
+	);
+}
 
 /**
  * Who a write is attributed to. Defaulting to the app is the whole point of the
@@ -109,10 +205,15 @@ export function withClosingKeywords(
  * cannot know whether a 422 involved assignees or which identity the caller
  * asked for. That knowledge only exists here.
  */
-export function explain(error: unknown, args: any, tenant: Tenant): string {
+export function explain(error: unknown, args: any, tenant: Tenant, tool?: string): string {
 	const base = error instanceof Error ? error.message : String(error);
 	if (!(error instanceof GitHubError)) {
 		return base;
+	}
+
+	const feature = tool ? securityFeatureOf(tool) : undefined;
+	if (feature) {
+		return explainSecurity(error, base, feature, args, tenant);
 	}
 
 	const actor: "app" | "user" = args?.act_as === "user" ? "user" : "app";
@@ -184,6 +285,143 @@ export function explain(error: unknown, args: any, tenant: Tenant): string {
 		default:
 			return base;
 	}
+}
+
+// ------------------------------------------------------------ security tools
+
+export interface SecurityFeature {
+	/** As GitHub names the feature in its UI. */
+	name: string;
+	/** What it holds, phrased to sit mid-sentence. */
+	items: string;
+	/** As the App's settings page names the repository permission. */
+	permission: string;
+	/** What a repository admin does to turn the feature on. */
+	enable: string;
+}
+
+export const SECURITY_FEATURES = {
+	dependabot: {
+		name: "Dependabot alerts",
+		items: "Dependabot alerts",
+		permission: "Dependabot alerts",
+		enable:
+			"A repository admin can turn on Dependabot alerts under Settings → Code security. " +
+			"They are available on every plan.",
+	},
+	codeScanning: {
+		name: "Code scanning",
+		items: "code scanning alerts",
+		permission: "Code scanning alerts",
+		enable:
+			"A repository admin can set it up (for example CodeQL's default setup) under " +
+			"Settings → Code security. Results appear only after the first analysis " +
+			"completes. On private repositories it needs GitHub Code Security.",
+	},
+	secretScanning: {
+		name: "Secret scanning",
+		items: "secret scanning alerts",
+		permission: "Secret scanning alerts",
+		enable:
+			"A repository admin can turn it on under Settings → Code security. It is free on " +
+			"public repositories; private repositories need GitHub Secret Protection.",
+	},
+	advisories: {
+		name: "Repository security advisories",
+		items: "draft and privately reported security advisories",
+		permission: "Repository security advisories",
+		enable:
+			"Privately reported vulnerabilities only arrive if a repository admin turns on " +
+			"private vulnerability reporting under Settings → Code security.",
+	},
+} satisfies Record<string, SecurityFeature>;
+
+const SECURITY_TOOLS = new Map<string, SecurityFeature>(
+	Object.entries({
+		list_dependabot_alerts: SECURITY_FEATURES.dependabot,
+		get_dependabot_alert: SECURITY_FEATURES.dependabot,
+		list_code_scanning_alerts: SECURITY_FEATURES.codeScanning,
+		get_code_scanning_alert: SECURITY_FEATURES.codeScanning,
+		list_secret_scanning_alerts: SECURITY_FEATURES.secretScanning,
+		get_secret_scanning_alert: SECURITY_FEATURES.secretScanning,
+		list_security_advisories: SECURITY_FEATURES.advisories,
+		get_security_advisory: SECURITY_FEATURES.advisories,
+	}),
+);
+
+/** The security feature a tool reads, or undefined for every other tool. */
+export function securityFeatureOf(tool: string): SecurityFeature | undefined {
+	return SECURITY_TOOLS.get(tool);
+}
+
+/**
+ * GitHub's own wording when a feature is off rather than access is missing. It
+ * answers with 403 or 404 depending on the feature, so the status alone cannot
+ * tell the two apart and a model would otherwise chase a permission problem
+ * that isn't there.
+ */
+const FEATURE_OFF =
+	/\b(disabled|not enabled|must be enabled|no analysis found|advanced security)\b/i;
+
+/**
+ * The security tools are all reads, so they run as the signed-in person, and a
+ * person's token reaches only what the App's permissions AND that person's own
+ * repository access both allow. That makes three different fixes possible for
+ * the same status code, and this says which one applies.
+ */
+function explainSecurity(
+	error: GitHubError,
+	base: string,
+	feature: SecurityFeature,
+	args: any,
+	tenant: Tenant,
+): string {
+	const target = args?.owner && args?.repo ? `${args.owner}/${args.repo}` : "that repository";
+
+	if (error.status === 422) {
+		return base.replace(
+			ISSUE_422_HINT,
+			"One of the filter values was not accepted — check it against the tool's options.",
+		);
+	}
+
+	if (error.status !== 403 && error.status !== 404) {
+		return base;
+	}
+
+	if (/rate limit/i.test(base)) {
+		return base;
+	}
+
+	if (FEATURE_OFF.test(base)) {
+		// The client's generic 403 wording blames permissions, so say plainly
+		// that this is the other cause.
+		return (
+			`${base}\n\nThis is not a permission problem: ${feature.items} are not available ` +
+			`because the feature is turned off for ${target}. ${feature.enable}`
+		);
+	}
+
+	// Both statuses already say which identity the request ran as.
+	const access =
+		`@${tenant.login} needs elevated access to ${target}: GitHub shows ${feature.items} ` +
+		`only to people with write access or above, and some only to admins or the ` +
+		`security manager role.`;
+
+	if (error.status === 404) {
+		return (
+			`${base}\n\nEither ${target} or the item does not exist, or @${tenant.login} ` +
+			`cannot see it. ${access}`
+		);
+	}
+
+	return (
+		`${base}\n\nTwo things must both be true. First, the App's "${feature.permission}" ` +
+		`repository permission must be granted at read. Granting it in the App's settings ` +
+		`is not enough on its own — the owner of the installation on ${tenant.accountLogin} ` +
+		`must approve the update before its tokens carry it; check for a pending approval ` +
+		`at https://github.com/settings/installations. Second, ${access}`
+	);
 }
 
 /**
