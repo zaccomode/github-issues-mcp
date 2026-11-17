@@ -3,10 +3,12 @@ import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 /**
  * The runtime environment, as the rest of the code wants to see it.
  *
- * Two things need fixing up over the generated `Env`. Secrets never appear in
- * wrangler.jsonc, so `wrangler types` cannot know about them; and plain vars are
+ * Three things need fixing up over the generated `Env`. Secrets never appear in
+ * wrangler.jsonc, so `wrangler types` cannot know about them; plain vars are
  * generated as the *literal* value in the config file, so `GITHUB_APP_ID` would
- * otherwise be typed as the empty string.
+ * otherwise be typed as the empty string; and `wrangler types` reads secret names
+ * from .dev.vars and types each as a required string, but the webhook secret is
+ * optional — without it, src/auth/webhook.ts answers 501 instead of verifying.
  */
 export interface AppEnv extends Omit<
 	Env,
@@ -15,6 +17,7 @@ export interface AppEnv extends Omit<
 	| "GITHUB_CLIENT_ID"
 	| "PUBLIC_URL"
 	| "DEFAULT_MONTHLY_QUOTA"
+	| "GITHUB_WEBHOOK_SECRET"
 > {
 	GITHUB_APP_ID: string;
 	GITHUB_APP_SLUG: string;
