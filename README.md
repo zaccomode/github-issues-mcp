@@ -23,7 +23,9 @@ Security (read-only): `list_dependabot_alerts`, `get_dependabot_alert`,
 
 Releases: `list_releases`, `get_release`, `list_release_assets`, `list_tags`,
 `compare_refs`, `generate_release_notes`, `create_release`, `update_release`,
-`publish_release`, `unpublish_release`, `delete_release`.
+`publish_release`, `unpublish_release`, `delete_release`,
+`create_release_asset_upload`, `upload_release_asset`, `update_release_asset`,
+`delete_release_asset`.
 
 The write tools accept `act_as`. Reads always run as the signed-in person,
 so what an agent can see matches what you can see — which does mean
@@ -74,8 +76,8 @@ Protection. Each of these failures gets its own explanation in the tool error.
 
 ### Releases
 
-The release tools read releases, draft notes, and create, publish, unpublish and
-delete releases.
+The release tools read releases, draft notes, create, publish, unpublish and
+delete releases, and manage the files attached to them.
 
 - **Drafts first.** `create_release` only creates drafts, which notify nobody and
   start no workflows. `generate_release_notes` has GitHub write notes from the
@@ -96,9 +98,33 @@ delete releases.
 - **Tags must be explicit.** If a tag doesn't exist yet, `create_release` needs
   `target_commitish`; otherwise GitHub would tag whatever the default branch
   points at when the release is published.
-- **No asset uploads yet.** `list_release_assets` reads them; uploading and
-  managing files is tracked in
-  [#4](https://github.com/zaccomode/github-issues-mcp/issues/4).
+- **Asset changes follow the same rules.** `update_release_asset` (rename or
+  relabel) and `delete_release_asset` work on drafts, or on published releases
+  with `allow_published: true`. Published immutable releases can't be changed.
+
+#### Uploading assets
+
+Files don't travel inside the tool call. `create_release_asset_upload` returns a
+single-use link on this server that expires after 15 minutes, plus a ready-made
+`curl` command. The agent sends the file from its shell, and the server streams
+it on to GitHub as the chosen `act_as` identity, without buffering it:
+
+```bash
+curl -sS --fail-with-body --upload-file ./dist/app.zip \
+  -H 'Content-Type: application/zip' "$UPLOAD_URL"
+```
+
+- **One file per link, up to 100 MB,** which is Cloudflare's request body limit
+  on the Free and Pro plans. Larger files need a Business or Enterprise zone.
+- **The agent's machine has to reach this server.** MCP calls go through the
+  client, but the upload goes straight from the agent's shell. In sandboxed
+  environments such as Claude's cloud sessions, add this server's host (for the
+  public App, `github-issues-mcp.zaccomode.workers.dev`) to the environment's
+  allowed network hosts.
+- **No shell?** `upload_release_asset` takes the content directly, as text or
+  base64, up to 256 KB. It's meant for checksums, SBOMs and changelogs.
+- **No fetching from URLs.** That would let any caller make the server request
+  any address it likes.
 
 These tools need the App's Contents permission (see below). GitHub also refuses
 to point a release at a commit that changes files in `.github/workflows/`
@@ -191,6 +217,8 @@ npm run check   # lint + type-check
 
 **Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
 
+**Upload links** are stored in D1 rather than KV, because only D1's `UPDATE … WHERE used_at IS NULL` can stop a link being used twice. Only the link's SHA-256 is stored. A link made with `act_as: "user"` has to carry the person's token until the file arrives, so the token is encrypted with a key derived from the link itself: the row alone can't be turned back into a credential.
+
 **Why refresh only happens in `tokenExchangeCallback`.** Using a GitHub refresh
 token invalidates the previous pair, and an API request has no way to write
 `props` back. Refreshing lazily on a 401 would therefore spend the refresh token,
@@ -214,8 +242,8 @@ per hour is shared across every GitHub App acting on their behalf.
 
 **Contents permission, but no tool that writes code.** The release tools need
 `Contents: read & write`, because GitHub has no narrower permission for
-releases. The same permission would let a token push commits, create branches
-and merge pull requests, so installing the App grants that much. No tool here
+releases and their assets. The same permission would let a token push commits,
+create branches and merge pull requests, so installing the App grants that much. No tool here
 does any of those things: the server opens and annotates pull requests and
 manages releases, and never writes code, merges or deletes tags.
 

@@ -15,7 +15,7 @@
  * - **Release text is untrusted.** Bodies and generated notes quote pull
  *   request titles and commit messages that any contributor can write.
  *
- * Uploading and managing asset files is not offered yet; see issue #4.
+ * Uploading, renaming and deleting asset files live in ./release-assets.ts.
  */
 
 import { z } from "zod";
@@ -70,7 +70,7 @@ const makeLatest = z
 			"creation date and semantic version. Drafts and prereleases cannot be latest.",
 	);
 
-const releaseId = z.number().int().positive().describe("The release's numeric id");
+export const releaseId = z.number().int().positive().describe("The release's numeric id");
 
 const TRIGGERS_WORKFLOWS =
 	"Publishing notifies everyone watching the repository, and starts any workflow that " +
