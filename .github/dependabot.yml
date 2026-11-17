@@ -28,3 +28,12 @@ updates:
               exclude-patterns:
                   - agents
                   - "@cloudflare/workers-oauth-provider"
+
+    # The SHA-pinned actions in .github/workflows.
+    - package-ecosystem: github-actions
+      directory: /
+      schedule:
+          interval: weekly
+      groups:
+          actions:
+              patterns: ["*"]

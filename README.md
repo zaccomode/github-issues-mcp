@@ -86,9 +86,12 @@ delete releases, and manage the files attached to them.
   pull requests merged since the last release without saving anything, and
   `compare_refs` lists the commits between two refs for writing notes by hand.
 - **Publishing takes two calls.** `publish_release` without `confirm` publishes
-  nothing: it checks the release is ready and lists the workflows in
-  `.github/workflows/` that run `on: release`. Calling it again with
-  `confirm: true` publishes. This matters because a release published with an
+  nothing: it checks the release is ready, resolves the commit it would tag,
+  lists the workflows in `.github/workflows/` that run `on: release`, and returns
+  a `confirm_token`. Calling it again with `confirm: true` and that token
+  publishes, with the tag pinned to the previewed commit. If the release, its
+  target or the branch head changed in between, the token no longer matches and
+  nothing is published. This matters because a release published with an
   App's token starts workflows, unlike one published with Actions' own
   `GITHUB_TOKEN`, so publishing can deploy or push a package.
 - **Unpublishing only hides.** `unpublish_release` turns a release back into a
@@ -97,9 +100,13 @@ delete releases, and manage the files attached to them.
   published, so it can't be unpublished.
 - **Tags are never deleted.** `delete_release` removes drafts, or published
   releases with `allow_published: true`, and leaves the tag in place.
-- **Tags must be explicit.** If a tag doesn't exist yet, `create_release` needs
-  `target_commitish`; otherwise GitHub would tag whatever the default branch
-  points at when the release is published.
+- **Tags must be explicit.** If a tag doesn't exist yet, `create_release` and
+  `update_release` need `target_commitish`; otherwise GitHub would tag whatever
+  the default branch points at.
+- **Published releases need `allow_published`.** `update_release` changes drafts
+  only, unless given `allow_published: true`. On a published release, a new
+  `tag_name` creates that tag at once, and any edit starts `release: edited`
+  workflows.
 - **Asset changes follow the same rules.** `update_release_asset` (rename or
   relabel) and `delete_release_asset` work on drafts, or on published releases
   with `allow_published: true`. Published immutable releases can't be changed.
@@ -177,6 +184,9 @@ npm run cf-typegen
 npm run db:migrate
 ```
 
+`npm run deploy` applies any pending migrations before it deploys, so a new
+migration never lands after the code that needs it.
+
 ### 3. Set the secrets
 
 ```bash
@@ -213,13 +223,16 @@ webhooks.
 
 ```bash
 npm run check   # lint + type-check
+npm test        # unit tests, in the Workers runtime with a local D1
 ```
+
+CI runs both on every pull request.
 
 ## Design notes
 
 **Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
 
-**Upload links** are stored in D1 rather than KV, because only D1's `UPDATE … WHERE used_at IS NULL` can stop a link being used twice. Only the link's SHA-256 is stored. A link made with `act_as: "user"` has to carry the person's token until the file arrives, so the token is encrypted with a key derived from the link itself: the row alone can't be turned back into a credential.
+**Upload links** are stored in D1 rather than KV, because only D1's `UPDATE … WHERE used_at IS NULL` can stop a link being used twice. Only the link's SHA-256 is stored. A link made with `act_as: "user"` has to carry the person's token until the file arrives, so the token is encrypted with a key derived from both the link and the Worker's `GITHUB_CLIENT_SECRET`: neither the row nor the URL, which turns up in logs, can be turned back into a credential on its own. The sealed token is cleared the moment the link is claimed, and from any link that expires unused. Each link also records the OAuth grant that made it, and the upload is refused if that grant has been revoked since.
 
 **Why refresh only happens in `tokenExchangeCallback`.** Using a GitHub refresh
 token invalidates the previous pair, and an API request has no way to write

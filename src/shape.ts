@@ -5,6 +5,8 @@
  * large amount of context on every listing for no benefit.
  */
 
+import type { GitHubRelease, GitHubReleaseAsset } from "./github/releases";
+
 /** A label is either a full object or, on some endpoints, a bare string. */
 function labelName(label: any): string {
 	return typeof label === "string" ? label : label.name;
@@ -278,7 +280,7 @@ export function compactRepositoryAdvisory(advisory: any, detail = false) {
  * A release, with its notes and asset details only when `detail` is set —
  * listings stay small, and get_release carries the rest.
  */
-export function compactRelease(release: any, detail = false) {
+export function compactRelease(release: GitHubRelease, detail = false) {
 	const assets = release.assets ?? [];
 	return {
 		id: release.id,
@@ -303,7 +305,7 @@ export function compactRelease(release: any, detail = false) {
 	};
 }
 
-export function compactReleaseAsset(asset: any) {
+export function compactReleaseAsset(asset: GitHubReleaseAsset) {
 	return {
 		id: asset.id,
 		name: asset.name,

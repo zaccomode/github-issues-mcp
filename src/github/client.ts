@@ -173,10 +173,14 @@ export async function ghUpload<T>(
 
 	const attempt = async (token: string) => {
 		let body: ReadableStream<Uint8Array> | Uint8Array = upload.data;
-		let piping: Promise<void> | undefined;
+		let piping: Promise<unknown> | undefined;
 		if (upload.data instanceof ReadableStream) {
 			const { readable, writable } = new FixedLengthStream(upload.length);
-			piping = upload.data.pipeTo(writable);
+			// Handled where it is made: if fetch() rejects, the await below never
+			// runs, and a rejection with no handler attached would go unhandled.
+			// A failed pipe (the client hung up, or sent the wrong length) already
+			// shows up as a failed fetch or a GitHub error, so nothing is lost.
+			piping = upload.data.pipeTo(writable).catch(() => undefined);
 			body = readable;
 		}
 
@@ -192,10 +196,7 @@ export async function ghUpload<T>(
 			},
 			body,
 		});
-		// A failed pipe (the client hung up, or sent the wrong length) already
-		// shows up as a failed fetch or a GitHub error; this only keeps it from
-		// surfacing a second time as an unhandled rejection.
-		await piping?.catch(() => undefined);
+		await piping;
 		return response;
 	};
 
@@ -280,6 +281,15 @@ export const ISSUE_422_HINT =
 export function seg(value: string): string {
 	return encodeURIComponent(value);
 }
+
+/** A repository, as every repository-scoped tool and helper takes it. */
+export interface Repo {
+	owner: string;
+	repo: string;
+}
+
+/** Builds the `/repos/{owner}/{repo}` prefix with both segments escaped. */
+export const repoPath = (a: Repo) => `/repos/${seg(a.owner)}/${seg(a.repo)}`;
 
 async function toGitHubError(
 	response: Response,
