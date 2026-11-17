@@ -1,8 +1,10 @@
-# github-issues-mcp
+# github-utilities-mcp
 
-A remote, Cloudflare Workers-based MCP server to manage GitHub issues, deployed as a GitHub app so that an agent's changes are attributable.
+A remote, Cloudflare Workers-based MCP server to manage GitHub issues, releases, PRs, security scans and more, deployed as a GitHub app so that an agent's changes are attributable.
 
-This MCP server exists because the official GitHub MCP server must be run locally to connect to Claude Desktop, thus preventing it from properly working with Claude's cloud agent functionality. This works anywhere an MCP server is accepted, without all the fiddling the official one currently requires.
+This MCP server exists because the official GitHub MCP server must be run locally to connect to Claude Desktop, thus preventing it from properly working with Claude's cloud agent environment. This works anywhere an MCP server is accepted, without all the fiddling the official one currently requires. 
+
+The MCP server also supports app attribution, allowing the work an agent does autonomously to be attributed to someone other than you. It makes you look slightly less insane than replying to yourself in conversations, and gives you a clear blame path for issues.
 
 > **This is an app you can install yourself!** I'm hosting a public version here that you can install to your account without having to host it yourself, giving you 5,000 requests an hour.
 >
