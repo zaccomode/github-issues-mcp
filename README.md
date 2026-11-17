@@ -187,8 +187,6 @@ webhooks.
 npm run check   # lint + type-check
 ```
 
-[TESTING.md](./TESTING.md) is the runbook for proving it actually works by what has already been verified, what hasn't, and the order to test in.
-
 ## Design notes
 
 **Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
