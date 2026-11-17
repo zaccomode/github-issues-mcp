@@ -21,7 +21,11 @@ Security (read-only): `list_dependabot_alerts`, `get_dependabot_alert`,
 `list_secret_scanning_alerts`, `get_secret_scanning_alert`,
 `list_security_advisories`, `get_security_advisory`.
 
-The eight write tools accept `act_as`. Reads always run as the signed-in person,
+Releases: `list_releases`, `get_release`, `list_release_assets`, `list_tags`,
+`compare_refs`, `generate_release_notes`, `create_release`, `update_release`,
+`publish_release`, `unpublish_release`, `delete_release`.
+
+The write tools accept `act_as`. Reads always run as the signed-in person,
 so what an agent can see matches what you can see — which does mean
 `search_issues` can surface issues in repositories the write tools cannot touch.
 `whoami` reports both identities and where the App is actually installed.
@@ -68,21 +72,53 @@ usually means write access or above. Code scanning and secret scanning must also
 repository; on private repositories they need GitHub Code Security and Secret
 Protection. Each of these failures gets its own explanation in the tool error.
 
+### Releases
+
+The release tools read releases, draft notes, and create, publish, unpublish and
+delete releases.
+
+- **Drafts first.** `create_release` only creates drafts, which notify nobody and
+  start no workflows. `generate_release_notes` has GitHub write notes from the
+  pull requests merged since the last release without saving anything, and
+  `compare_refs` lists the commits between two refs for writing notes by hand.
+- **Publishing takes two calls.** `publish_release` without `confirm` publishes
+  nothing: it checks the release is ready and lists the workflows in
+  `.github/workflows/` that run `on: release`. Calling it again with
+  `confirm: true` publishes. This matters because a release published with an
+  App's token starts workflows, unlike one published with Actions' own
+  `GITHUB_TOKEN`, so publishing can deploy or push a package.
+- **Unpublishing only hides.** `unpublish_release` turns a release back into a
+  draft, but notifications already sent and workflows already started stay done.
+  Repositories with immutable releases turned on lock a release once it is
+  published, so it can't be unpublished.
+- **Tags are never deleted.** `delete_release` removes drafts, or published
+  releases with `allow_published: true`, and leaves the tag in place.
+- **Tags must be explicit.** If a tag doesn't exist yet, `create_release` needs
+  `target_commitish`; otherwise GitHub would tag whatever the default branch
+  points at when the release is published.
+- **No asset uploads yet.** `list_release_assets` reads them; uploading and
+  managing files is tracked in
+  [#4](https://github.com/zaccomode/github-issues-mcp/issues/4).
+
+These tools need the App's Contents permission (see below). GitHub also refuses
+to point a release at a commit that changes files in `.github/workflows/`
+unless the token holds the Workflows permission, which this App doesn't ask for.
+
 ## Setting it up
 
 ### 1. Register a GitHub App
 
 <https://github.com/settings/apps/new>
 
-| Setting                                                | Value                                                                              |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
-| Callback URL                                           | `https://<your-host>/callback`                                                     |
-| Request user authorization (OAuth) during installation | **on**                                                                             |
-| Expire user authorization tokens                       | **on**                                                                             |
-| Setup URL                                              | leave blank                                                                        |
-| Webhook URL                                            | `https://<your-host>/webhooks/github`                                              |
-| Repository permissions                                 | Issues: **read & write**; Pull requests: **read & write**; Metadata: **read-only** |
-| Where can this be installed                            | **Any account**                                                                    |
+| Setting                                                | Value                                                                                                          |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Callback URL                                           | `https://<your-host>/callback`                                                                                 |
+| Request user authorization (OAuth) during installation | **on**                                                                                                         |
+| Expire user authorization tokens                       | **on**                                                                                                         |
+| Setup URL                                              | leave blank                                                                                                    |
+| Webhook URL                                            | `https://<your-host>/webhooks/github`                                                                          |
+| Repository permissions                                 | Issues: **read & write**; Pull requests: **read & write**; Contents: **read & write**; Metadata: **read-only** |
+| Where can this be installed                            | **Any account**                                                                                                |
 
 The security tools also need these repository permissions at **read-only**:
 Dependabot alerts, Code scanning alerts, Secret scanning alerts, and Repository
@@ -151,8 +187,6 @@ webhooks.
 npm run check   # lint + type-check
 ```
 
-[TESTING.md](./TESTING.md) is the runbook for proving it actually works by what has already been verified, what hasn't, and the order to test in.
-
 ## Design notes
 
 **Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
@@ -178,10 +212,12 @@ the `quotas` table are the seam one would attach to.
 `act_as`: an installation gets its own 5,000–12,500/hour, while a user's 5,000
 per hour is shared across every GitHub App acting on their behalf.
 
-**No `Contents` permission.** Merging a PR and creating a branch both need
-`Contents: write`, so neither is offered. The server opens and annotates pull
-requests; it never writes code or merges anything. That is a deliberate ceiling
-on what a tenant is agreeing to when they install the App.
+**Contents permission, but no tool that writes code.** The release tools need
+`Contents: read & write`, because GitHub has no narrower permission for
+releases. The same permission would let a token push commits, create branches
+and merge pull requests, so installing the App grants that much. No tool here
+does any of those things: the server opens and annotates pull requests and
+manages releases, and never writes code, merges or deletes tags.
 
 **Changing permissions is not retroactive.** If you add a repository permission
 after people have installed the App, every existing installation keeps the old

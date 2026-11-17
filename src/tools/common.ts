@@ -257,6 +257,13 @@ export function explain(
 		return explainSecurity(error, base, feature, args, tenant);
 	}
 
+	if (RELEASE_TOOLS.has(tool)) {
+		const explained = explainRelease(error, base, tool, tenant);
+		if (explained !== undefined) {
+			return explained;
+		}
+	}
+
 	const { actor, switchable } = identity;
 	const target = args?.owner && args?.repo ? `${args.owner}/${args.repo}` : "that repository";
 	// Only the pull request tools take these, and they are what distinguish a
@@ -273,7 +280,7 @@ export function explain(
 				return (
 					`${base}\n\nCreating a pull request fails with 422 for three common ` +
 					`reasons: the head branch \`${args.head}\` has not been pushed to GitHub ` +
-					`yet (this server cannot push — commit and push with git first), there ` +
+					`yet (this server has no tool that pushes — commit and push with git first), there ` +
 					`are no commits between \`${args.base}\` and \`${args.head}\`, or an open ` +
 					`pull request for that branch already exists.`
 				);
@@ -288,17 +295,20 @@ export function explain(
 			}
 			return base;
 
-		case 404:
+		case 404: {
+			const extra = releaseNotFoundNote(tool);
+			const tail = extra ? `\n\n${extra}` : "";
 			if (actor === "app") {
 				return (
 					`${base}\n\nThe app is installed on ${tenant.accountLogin}. Because GitHub ` +
 					`returns 404 rather than 403 for repositories an installation cannot see, ` +
 					`this usually means the app was never granted access to ${target}. Add it at ` +
 					`https://github.com/settings/installations, or retry with act_as: "user" if ` +
-					`you personally have access.`
+					`you personally have access.${tail}`
 				);
 			}
-			return `${base}\n\n${userCannotSee(target, tenant)}`;
+			return `${base}\n\n${userCannotSee(target, tenant)}${tail}`;
+		}
 
 		case 403:
 			if (actor === "user" && /rate limit/i.test(base)) {
@@ -327,6 +337,87 @@ export function explain(
 		default:
 			return base;
 	}
+}
+
+// ------------------------------------------------------------- release tools
+
+const RELEASE_TOOLS = new Set([
+	"list_releases",
+	"get_release",
+	"list_release_assets",
+	"list_tags",
+	"compare_refs",
+	"generate_release_notes",
+	"create_release",
+	"update_release",
+	"publish_release",
+	"unpublish_release",
+	"delete_release",
+]);
+
+/** The release tools that can create a tag or move one, and so a release's target. */
+const RELEASE_TARGET_WRITES = new Set(["create_release", "update_release", "publish_release"]);
+
+/**
+ * GitHub refuses to point a release at a commit that changes workflow files
+ * unless the token also holds the "Workflows" permission, which this App does
+ * not ask for — and it says so with a 404, or sometimes a 403, that reads like
+ * missing access.
+ */
+const WORKFLOW_FILES_NOTE =
+	"If the release's target commit adds or changes files under .github/workflows/ " +
+	'compared with the default branch, GitHub also requires the "Workflows" permission, ' +
+	"which this App does not request, and answers with this same error. Target a commit " +
+	"whose workflow files match the default branch, or create the release in GitHub's UI.";
+
+/**
+ * Release-specific explanations, or undefined to fall through to the general
+ * ones. Every release tool, reads included, needs the App's "Contents"
+ * permission, which installations made before the release tools existed have
+ * not yet approved.
+ */
+function explainRelease(
+	error: GitHubError,
+	base: string,
+	tool: string,
+	tenant: Tenant,
+): string | undefined {
+	const targetWrite = RELEASE_TARGET_WRITES.has(tool);
+
+	switch (error.status) {
+		case 422:
+			return base.replace(
+				ISSUE_422_HINT,
+				"Check that the tag is a valid git ref name, that target_commitish names an " +
+					"existing branch or commit, and that make_latest is not set on a prerelease.",
+			);
+
+		case 403:
+			if (/rate limit/i.test(base)) {
+				return undefined;
+			}
+			return (
+				`${base}\n\nRelease tools need the App's "Contents" repository permission (read ` +
+				`for reading releases, read & write for changing them), and the person signed in ` +
+				`needs push access to change releases. The permission was added to the App ` +
+				`after it was first published: the owner of the installation on ` +
+				`${tenant.accountLogin} must approve the update before its tokens carry it — ` +
+				`check for a pending approval at https://github.com/settings/installations.` +
+				(targetWrite ? `\n\n${WORKFLOW_FILES_NOTE}` : "")
+			);
+
+		case 404:
+			// The general 404 explanation still applies; this only adds to it.
+			return undefined;
+
+		default:
+			return base;
+	}
+}
+
+/** Extra context for a release write's 404, appended to the general explanation. */
+function releaseNotFoundNote(tool: string): string | undefined {
+	return RELEASE_TARGET_WRITES.has(tool) ? WORKFLOW_FILES_NOTE : undefined;
 }
 
 // ------------------------------------------------------------ security tools
