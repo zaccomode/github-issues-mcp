@@ -16,6 +16,7 @@ import {
 	scrub,
 	withClosingKeywords,
 } from "./common";
+import { registerReleaseAssetTools } from "./release-assets";
 import { registerReleaseTools } from "./releases";
 import { registerSecurityTools } from "./security";
 
@@ -43,7 +44,7 @@ const CLOSING_ISSUES_QUERY = `
 export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 	const server = new McpServer({
 		name: "github-issues",
-		version: "2.1.0",
+		version: "2.2.0",
 	});
 
 	/** Wraps a handler so GitHub failures surface as tool errors, not exceptions. */
@@ -713,6 +714,7 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 
 	registerSecurityTools(register, ctx);
 	registerReleaseTools(register, ctx);
+	registerReleaseAssetTools(register, ctx);
 
 	return server;
 }

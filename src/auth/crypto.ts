@@ -6,6 +6,10 @@
  * @cloudflare/workers-oauth-provider encrypts using the issued MCP token as key
  * material — so they cannot be recovered from KV without a live token. Mirroring
  * them anywhere else would trade that property away for nothing.
+ *
+ * The one exception keeps the same property: an upload link made to act as the
+ * user carries that user's token sealed under a key derived from the link
+ * itself, which is never stored. See src/uploads/links.ts.
  */
 
 export function base64ToBytes(value: string): Uint8Array {

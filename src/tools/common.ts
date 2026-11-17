@@ -353,6 +353,18 @@ const RELEASE_TOOLS = new Set([
 	"publish_release",
 	"unpublish_release",
 	"delete_release",
+	"create_release_asset_upload",
+	"upload_release_asset",
+	"update_release_asset",
+	"delete_release_asset",
+]);
+
+/** The release tools that change a release's files rather than the release. */
+const RELEASE_ASSET_WRITES = new Set([
+	"create_release_asset_upload",
+	"upload_release_asset",
+	"update_release_asset",
+	"delete_release_asset",
 ]);
 
 /** The release tools that can create a tag or move one, and so a release's target. */
@@ -388,8 +400,12 @@ function explainRelease(
 		case 422:
 			return base.replace(
 				ISSUE_422_HINT,
-				"Check that the tag is a valid git ref name, that target_commitish names an " +
-					"existing branch or commit, and that make_latest is not set on a prerelease.",
+				RELEASE_ASSET_WRITES.has(tool)
+					? "The asset name may already be taken on this release, the file may be " +
+							"empty, or the release may be immutable."
+					: "Check that the tag is a valid git ref name, that target_commitish names " +
+							"an existing branch or commit, and that make_latest is not set on a " +
+							"prerelease.",
 			);
 
 		case 403:

@@ -4,13 +4,16 @@
  *
  * The OAuth provider hands us any request that isn't an API route. Requests that
  * reach /mcp have already been authenticated by the library and are handled in
- * src/index.ts instead.
+ * src/index.ts instead. Upload links are routed from here too, but answer in
+ * JSON rather than HTML; see src/uploads/handler.ts.
  */
 
 import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
 import { type AppEnv, installUrl, publicUrl } from "../env";
 import { recordConnection, recordInstallation, recordUser } from "../db/tenants";
 import { html } from "../http";
+import { handleUpload } from "../uploads/handler";
+import { UPLOAD_PATH_PREFIX } from "../uploads/links";
 import {
 	consentPage,
 	errorPage,
@@ -34,6 +37,10 @@ import { handleWebhook } from "./webhook";
 export const authorizeHandler = {
 	async fetch(request: Request, env: AppEnv): Promise<Response> {
 		const url = new URL(request.url);
+
+		if (url.pathname.startsWith(UPLOAD_PATH_PREFIX)) {
+			return handleUpload(request, env);
+		}
 
 		try {
 			switch (url.pathname) {

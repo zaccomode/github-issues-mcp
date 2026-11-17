@@ -9,6 +9,8 @@
  */
 
 const GITHUB_API = "https://api.github.com";
+/** Release asset uploads go to their own host, not the REST API's. */
+const GITHUB_UPLOADS = "https://uploads.github.com";
 const API_VERSION = "2022-11-28";
 const USER_AGENT = "github-issues-mcp";
 
@@ -139,6 +141,75 @@ export async function ghRaw<T>(
 	return finish<T>(await send(token, path, options), undefined);
 }
 
+/** A file body for `ghUpload()`, with the length GitHub requires up front. */
+export interface UploadBody {
+	/**
+	 * A stream can be sent only once, so a stale token is not retried for it —
+	 * make an authenticated request with the same source first, which renews
+	 * the token if it needs renewing.
+	 */
+	data: ReadableStream<Uint8Array> | Uint8Array;
+	length: number;
+	contentType: string;
+}
+
+/**
+ * Uploads a release asset. GitHub takes the file as a raw body on a separate
+ * host, so `gh()`, which sends JSON to the REST API, cannot do it.
+ *
+ * The body goes out with a fixed `Content-Length` rather than chunked:
+ * `FixedLengthStream` is what makes the Workers runtime do that for a stream,
+ * and it also errors if the stream turns out longer or shorter than promised.
+ * The stream is passed through, never buffered, so the Worker's memory limit
+ * does not cap the file size.
+ */
+export async function ghUpload<T>(
+	source: TokenSource,
+	path: string,
+	query: Record<string, QueryValue>,
+	upload: UploadBody,
+): Promise<T> {
+	const url = buildUrl(path, query, GITHUB_UPLOADS);
+
+	const attempt = async (token: string) => {
+		let body: ReadableStream<Uint8Array> | Uint8Array = upload.data;
+		let piping: Promise<void> | undefined;
+		if (upload.data instanceof ReadableStream) {
+			const { readable, writable } = new FixedLengthStream(upload.length);
+			piping = upload.data.pipeTo(writable);
+			body = readable;
+		}
+
+		const response = await fetch(url, {
+			method: "POST",
+			headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${token}`,
+				"Content-Type": upload.contentType,
+				"Content-Length": String(upload.length),
+				"User-Agent": USER_AGENT,
+				"X-GitHub-Api-Version": API_VERSION,
+			},
+			body,
+		});
+		// A failed pipe (the client hung up, or sent the wrong length) already
+		// shows up as a failed fetch or a GitHub error; this only keeps it from
+		// surfacing a second time as an unhandled rejection.
+		await piping?.catch(() => undefined);
+		return response;
+	};
+
+	let response = await attempt(await source.token());
+	if (response.status === 401 && !(upload.data instanceof ReadableStream)) {
+		const renewed = await source.renew();
+		if (renewed) {
+			response = await attempt(renewed);
+		}
+	}
+
+	return finish<T>(response, source);
+}
+
 async function send(token: string, path: string, options: RequestOptions): Promise<Response> {
 	const url = buildUrl(path, options.query);
 
@@ -162,13 +233,17 @@ async function send(token: string, path: string, options: RequestOptions): Promi
  * bearer token there. Both the prefix check and the origin check are load
  * bearing; `seg()` alone is not enough, because it is easy to forget one.
  */
-function buildUrl(path: string, query?: Record<string, QueryValue>): URL {
+function buildUrl(
+	path: string,
+	query?: Record<string, QueryValue>,
+	origin: typeof GITHUB_API | typeof GITHUB_UPLOADS = GITHUB_API,
+): URL {
 	if (!path.startsWith("/") || path.startsWith("//")) {
 		throw new Error(`Refusing to request a non-absolute GitHub path: ${path}`);
 	}
 
-	const url = new URL(path, GITHUB_API);
-	if (url.origin !== GITHUB_API) {
+	const url = new URL(path, origin);
+	if (url.origin !== origin) {
 		throw new Error(`Refusing to send a GitHub token to ${url.origin}.`);
 	}
 
