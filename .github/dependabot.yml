@@ -1,0 +1,30 @@
+# Routine version updates. The security side — alerts, and the PRs that fix
+# them — is a repository setting rather than anything in this file, and is on.
+version: 2
+updates:
+    # One package.json and one lockfile at the root, so a single entry covers it.
+    - package-ecosystem: npm
+      directory: /
+      schedule:
+          interval: weekly
+      open-pull-requests-limit: 5
+
+      # Split by whether the dependency ships. The production half (the MCP SDK,
+      # workers-oauth-provider, agents, zod) is bundled into the deployed Worker
+      # and sits on the OAuth path; the dev half is wrangler, typescript and the
+      # ox* tooling. Majors stay out of the groups, each arriving as its own
+      # reviewable PR.
+      #
+      # agents and @cloudflare/workers-oauth-provider are still 0.x, where a
+      # "minor" is semver's breaking bump, so they are excluded from the batch
+      # and arrive alone too. Fold them back in once they reach 1.0.
+      groups:
+          dev-minor-patch:
+              dependency-type: development
+              update-types: [minor, patch]
+          prod-minor-patch:
+              dependency-type: production
+              update-types: [minor, patch]
+              exclude-patterns:
+                  - agents
+                  - "@cloudflare/workers-oauth-provider"
