@@ -8,8 +8,9 @@
  */
 
 import { z } from "zod";
-import { GitHubError, ISSUE_422_HINT, seg } from "../github/client";
+import { GitHubError, ISSUE_422_HINT } from "../github/client";
 import type { Credentials } from "../github/credentials";
+import type { GrantRef } from "../auth/props";
 import type { AppEnv } from "../env";
 
 export interface Tenant {
@@ -21,6 +22,8 @@ export interface Tenant {
 	/** The signed-in human. */
 	login: string;
 	userId: number;
+	/** The OAuth grant this request's token belongs to. */
+	grant?: GrantRef;
 }
 
 export interface ToolContext {
@@ -151,9 +154,7 @@ export const actAs = {
 		),
 };
 
-/** Builds the `/repos/{owner}/{repo}` prefix with both segments escaped. */
-export const repoPath = (a: { owner: string; repo: string }) =>
-	`/repos/${seg(a.owner)}/${seg(a.repo)}`;
+export { repoPath } from "../github/client";
 
 // ------------------------------------------------------- issue links on a PR
 

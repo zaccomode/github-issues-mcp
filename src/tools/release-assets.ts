@@ -19,12 +19,12 @@
 import { z } from "zod";
 import { publicUrl } from "../env";
 import { gh } from "../github/client";
+import { type GitHubRelease, type GitHubReleaseAsset, getMutableRelease } from "../github/releases";
 import { compactReleaseAsset } from "../shape";
 import {
 	assertNameFree,
 	assetNameProblem,
 	findAsset,
-	getMutableRelease,
 	guessContentType,
 	isContentType,
 	uploadAsset,
@@ -41,6 +41,14 @@ import { releaseId } from "./releases";
 
 /** The most an inline upload takes, after base64 decoding. */
 export const INLINE_MAX_BYTES = 256 * 1024;
+
+/**
+ * The longest `content` string accepted, checked before anything is decoded.
+ * Base64 takes four characters for every three bytes, and the slack leaves
+ * room for line breaks in wrapped base64. UTF-8 text never has more bytes than
+ * UTF-16 code units, so the precise byte check after decoding still applies.
+ */
+export const INLINE_MAX_CHARS = Math.ceil((INLINE_MAX_BYTES * 4) / 3) + 16;
 
 const assetName = z
 	.string()
@@ -96,12 +104,21 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 			},
 		},
 		async (a) => {
+			if (!ctx.tenant.grant) {
+				throw new Error(
+					"This connection's token does not name its grant, so an upload link cannot " +
+						"be tied to it. Reconnect the connector, or use upload_release_asset for " +
+						"a small file.",
+				);
+			}
+
 			const creds = ctx.creds.as(a.act_as);
 			const release = await getMutableRelease(creds, a, a.release_id);
 			await assertNameFree(creds, a, release, a.name);
 
 			const type = a.content_type ?? guessContentType(a.name);
 			const { secret, expiresAt } = await createUploadLink(ctx.env, {
+				grant: ctx.tenant.grant,
 				installationId: ctx.tenant.installationId,
 				accountLogin: ctx.tenant.accountLogin,
 				actor: a.act_as,
@@ -153,7 +170,14 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 				...repoShape,
 				release_id: releaseId,
 				name: assetName,
-				content: z.string().describe("The file's content"),
+				content: z
+					.string()
+					.max(
+						INLINE_MAX_CHARS,
+						"Inline content is limited to 256 KB. Use create_release_asset_upload " +
+							"and send the file from a shell instead.",
+					)
+					.describe("The file's content"),
 				encoding: z
 					.enum(["utf8", "base64"])
 					.default("utf8")
@@ -244,10 +268,14 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 				await assertNameFree(creds, a, release, a.name);
 			}
 
-			const updated = await gh<any>(creds, `${repoPath(a)}/releases/assets/${a.asset_id}`, {
-				method: "PATCH",
-				body: { name: a.name, label: a.label },
-			});
+			const updated = await gh<GitHubReleaseAsset>(
+				creds,
+				`${repoPath(a)}/releases/assets/${a.asset_id}`,
+				{
+					method: "PATCH",
+					body: { name: a.name, label: a.label },
+				},
+			);
 
 			return { asset: compactReleaseAsset(updated), previous_name: asset.name };
 		},
@@ -304,7 +332,7 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 async function assetOnRelease(
 	creds: Parameters<typeof getMutableRelease>[0],
 	a: { owner: string; repo: string; release_id: number; asset_id: number },
-): Promise<{ release: any; asset: any }> {
+): Promise<{ release: GitHubRelease; asset: GitHubReleaseAsset }> {
 	const release = await getMutableRelease(creds, a, a.release_id);
 	const asset = await findAsset(creds, a, release, { id: a.asset_id });
 	if (!asset) {
@@ -316,13 +344,20 @@ async function assetOnRelease(
 	return { release, asset };
 }
 
-function decode(content: string, encoding: "utf8" | "base64"): Uint8Array {
+export function decode(content: string, encoding: "utf8" | "base64"): Uint8Array {
 	if (encoding === "utf8") {
 		return new TextEncoder().encode(content);
 	}
 
+	// atob() throws a bare DOMException on anything malformed, so the shape is
+	// checked here first. Padding is optional, but when present it must bring
+	// the length to a multiple of four, which is where "ab=" fails.
 	const compact = content.replace(/\s/g, "");
-	if (!/^[A-Za-z0-9+/]*={0,2}$/.test(compact) || compact.length % 4 === 1) {
+	const padded = compact.endsWith("=");
+	if (
+		!/^[A-Za-z0-9+/]*={0,2}$/.test(compact) ||
+		(padded ? compact.length % 4 !== 0 : compact.length % 4 === 1)
+	) {
 		throw new Error("`content` is not valid base64.");
 	}
 	const binary = atob(compact);

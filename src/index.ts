@@ -1,7 +1,7 @@
 import { OAuthError, OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp";
 import { authorizeHandler } from "./auth/handler";
-import { type GrantProps, isGrantProps } from "./auth/props";
+import { type GrantProps, grantRefFromRequest, isGrantProps } from "./auth/props";
 import { ReauthorizationRequired, refreshUserToken } from "./auth/user-oauth";
 import { installationStatus } from "./db/tenants";
 import { checkQuota } from "./db/usage";
@@ -87,6 +87,7 @@ const mcpApiHandler = {
 				botLogin,
 				login: props.login,
 				userId: props.userId,
+				grant: grantRefFromRequest(request),
 			},
 			waitUntil: (promise) => ctx.waitUntil(promise),
 		});

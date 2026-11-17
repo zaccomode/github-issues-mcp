@@ -11,12 +11,14 @@
  */
 
 import { installationTokenSource } from "../auth/installation";
+import { grantIsActive } from "../auth/props";
 import { installationStatus } from "../db/tenants";
 import type { AppEnv } from "../env";
 import { GitHubError, ISSUE_422_HINT, type TokenSource } from "../github/client";
 import { compactReleaseAsset } from "../shape";
 import { scrub } from "../tools/common";
-import { getMutableRelease, isContentType, uploadAsset } from "./assets";
+import { getMutableRelease } from "../github/releases";
+import { isContentType, uploadAsset } from "./assets";
 import { type ClaimedUploadLink, UPLOAD_PATH_PREFIX, claimUploadLink } from "./links";
 
 /**
@@ -98,6 +100,11 @@ async function receive(request: Request, env: AppEnv): Promise<Response> {
 			unknown: [404, "This upload link does not exist."],
 			used: [410, "This upload link has already been used; each link takes one file."],
 			expired: [410, "This upload link has expired."],
+			unreadable: [
+				410,
+				"This upload link was made before a change to this server and can no longer " +
+					"act as the user.",
+			],
 		} as const;
 		const [status, message] = why[claim.reason];
 		return reply(status, { error: `${message} ${NEW_LINK}` });
@@ -111,6 +118,18 @@ async function receive(request: Request, env: AppEnv): Promise<Response> {
 			error:
 				`The GitHub App installation for ${link.accountLogin} is ${status}, so nothing ` +
 				`was uploaded. Reinstall the app and reconnect the connector.`,
+		});
+	}
+
+	// The grant that made the link may have been revoked since: the person
+	// disconnected the connector, or the grant expired. Links made before
+	// grants were recorded name none, and are refused for the same reason.
+	if (!link.grant || !(await grantIsActive(env.OAUTH_PROVIDER, link.grant))) {
+		return reply(403, {
+			error:
+				"The connection that made this upload link has been disconnected or has " +
+				"expired, so nothing was uploaded. Reconnect the connector, then make a new " +
+				"link.",
 		});
 	}
 

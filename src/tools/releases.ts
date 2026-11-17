@@ -19,7 +19,8 @@
  */
 
 import { z } from "zod";
-import { GitHubError, type TokenSource, gh } from "../github/client";
+import { GitHubError, type Repo, type TokenSource, gh } from "../github/client";
+import { type GitHubRelease, type GitHubReleaseAsset, getRelease } from "../github/releases";
 import { compactRelease, compactReleaseAsset } from "../shape";
 import { type Register, type ToolContext, actAs, paging, repoPath, repoShape } from "./common";
 
@@ -95,7 +96,7 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			},
 		},
 		async (a) => {
-			const raw = await gh<any[]>(ctx.creds.user, `${repoPath(a)}/releases`, {
+			const raw = await gh<GitHubRelease[]>(ctx.creds.user, `${repoPath(a)}/releases`, {
 				query: { per_page: a.per_page, page: a.page },
 			});
 			const releases = raw.map((release) => compactRelease(release));
@@ -130,13 +131,13 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				throw new Error("Give exactly one of release_id, tag, or latest: true.");
 			}
 
-			let release: any;
+			let release: GitHubRelease;
 			if (a.release_id !== undefined) {
 				release = await getRelease(ctx.creds.user, a, a.release_id);
 			} else if (a.tag !== undefined) {
 				release = await findReleaseByTag(ctx.creds.user, a, a.tag);
 			} else {
-				release = await gh<any>(ctx.creds.user, `${repoPath(a)}/releases/latest`);
+				release = await gh<GitHubRelease>(ctx.creds.user, `${repoPath(a)}/releases/latest`);
 			}
 
 			return { untrusted_fields: RELEASE_UNTRUSTED, release: compactRelease(release, true) };
@@ -157,7 +158,7 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			},
 		},
 		async (a) => {
-			const raw = await gh<any[]>(
+			const raw = await gh<GitHubReleaseAsset[]>(
 				ctx.creds.user,
 				`${repoPath(a)}/releases/${a.release_id}/assets`,
 				{ query: { per_page: a.per_page, page: a.page } },
@@ -180,9 +181,13 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			},
 		},
 		async (a) => {
-			const raw = await gh<any[]>(ctx.creds.user, `${repoPath(a)}/tags`, {
-				query: { per_page: a.per_page, page: a.page },
-			});
+			const raw = await gh<{ name: string; commit?: { sha: string } }[]>(
+				ctx.creds.user,
+				`${repoPath(a)}/tags`,
+				{
+					query: { per_page: a.per_page, page: a.page },
+				},
+			);
 			const tags = raw.map((tag) => ({ name: tag.name, sha: tag.commit?.sha }));
 			return { count: tags.length, page: a.page, tags };
 		},
@@ -206,12 +211,12 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			},
 		},
 		async (a) => {
-			const comparison = await gh<any>(
+			const comparison = await gh<GitHubComparison>(
 				ctx.creds.user,
 				`${repoPath(a)}/compare/${refPath(a.base)}...${refPath(a.head)}`,
 			);
 
-			const commits = (comparison.commits ?? []).map((commit: any) => ({
+			const commits = (comparison.commits ?? []).map((commit) => ({
 				sha: commit.sha,
 				message: firstLine(commit.commit?.message),
 				author: commit.author?.login ?? commit.commit?.author?.name ?? undefined,
@@ -270,15 +275,19 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			},
 		},
 		async (a) => {
-			const notes = await gh<any>(ctx.creds.user, `${repoPath(a)}/releases/generate-notes`, {
-				method: "POST",
-				body: {
-					tag_name: a.tag_name,
-					target_commitish: a.target_commitish,
-					previous_tag_name: a.previous_tag_name,
-					configuration_file_path: a.configuration_file_path,
+			const notes = await gh<{ name: string; body: string }>(
+				ctx.creds.user,
+				`${repoPath(a)}/releases/generate-notes`,
+				{
+					method: "POST",
+					body: {
+						tag_name: a.tag_name,
+						target_commitish: a.target_commitish,
+						previous_tag_name: a.previous_tag_name,
+						configuration_file_path: a.configuration_file_path,
+					},
 				},
-			});
+			);
 			return { untrusted_fields: RELEASE_UNTRUSTED, name: notes.name, body: notes.body };
 		},
 	);
@@ -338,9 +347,9 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				);
 			}
 
-			let release: any;
+			let release: GitHubRelease;
 			try {
-				release = await gh<any>(creds, `${repoPath(a)}/releases`, {
+				release = await gh<GitHubRelease>(creds, `${repoPath(a)}/releases`, {
 					method: "POST",
 					body: {
 						tag_name: a.tag_name,
@@ -377,8 +386,10 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			annotations: { destructiveHint: true },
 			description:
 				"Edit a release's title, notes, tag or flags. Take care: `body` REPLACES the " +
-				"notes; to add a section, use `body_append`. This cannot publish or unpublish " +
-				"— use publish_release and unpublish_release.",
+				"notes; to add a section, use `body_append`. Only drafts unless " +
+				"`allow_published: true`. A new tag that does not exist yet needs " +
+				"`target_commitish`; on a published release GitHub creates that tag at once. " +
+				"This cannot publish or unpublish — use publish_release and unpublish_release.",
 			inputSchema: {
 				...repoShape,
 				release_id: releaseId,
@@ -397,41 +408,90 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 					.string()
 					.min(1)
 					.optional()
-					.describe("Where a tag that does not exist yet will be created"),
+					.describe(
+						"The branch or commit SHA a tag that does not exist yet will point at. " +
+							"Required when `tag_name` names a new tag.",
+					),
 				prerelease: z.boolean().optional(),
 				make_latest: makeLatest,
 				discussion_category_name: z.string().optional(),
+				allow_published: z
+					.boolean()
+					.default(false)
+					.describe(
+						"Required to change a published release. People, update checkers and " +
+							"`release: edited` workflows may already depend on it.",
+					),
 				...actAs,
 			},
 		},
 		async (a) => {
 			const creds = ctx.creds.as(a.act_as);
+			const current = await getRelease(creds, a, a.release_id);
+
+			if (!current.draft && !a.allow_published) {
+				throw new Error(
+					`Release ${a.release_id} (${current.tag_name}) is published. Changing it ` +
+						`notifies nobody but starts any \`release: edited\` workflow, and a new ` +
+						`tag_name creates that tag straight away. Pass allow_published: true if ` +
+						`that is intended.`,
+				);
+			}
+
+			// The same rule as create_release: a new tag is never left to GitHub's
+			// default, which is whatever the default branch's head happens to be.
+			let tag: string | undefined;
+			if (a.tag_name !== undefined && a.tag_name !== current.tag_name) {
+				const tagExists = await refExists(creds, a, `tags/${a.tag_name}`);
+				if (!tagExists && !a.target_commitish) {
+					throw new Error(
+						`Tag ${a.tag_name} does not exist yet, so target_commitish is required — ` +
+							`the branch or commit SHA the tag should point at. Without it GitHub ` +
+							`would use whatever the default branch's latest commit is.`,
+					);
+				}
+				tag = tagExists
+					? `The release now uses the existing tag ${a.tag_name}.`
+					: current.draft
+						? `Tag ${a.tag_name} does not exist yet. GitHub creates it at ` +
+							`${a.target_commitish} when the release is published.`
+						: `Tag ${a.tag_name} did not exist, so GitHub created it at ` +
+							`${a.target_commitish}.`;
+			}
 
 			let body: string | undefined = a.body;
 			if (a.body_append !== undefined) {
-				const base = body ?? (await getRelease(creds, a, a.release_id)).body ?? "";
+				const base = body ?? current.body ?? "";
 				body = base.trim() ? `${base.trimEnd()}\n\n${a.body_append}` : a.body_append;
 			}
 
-			let release: any;
+			let release: GitHubRelease;
 			try {
-				release = await gh<any>(creds, `${repoPath(a)}/releases/${a.release_id}`, {
-					method: "PATCH",
-					body: {
-						name: a.name,
-						body,
-						tag_name: a.tag_name,
-						target_commitish: a.target_commitish,
-						prerelease: a.prerelease,
-						make_latest: a.make_latest,
-						discussion_category_name: a.discussion_category_name,
+				release = await gh<GitHubRelease>(
+					creds,
+					`${repoPath(a)}/releases/${a.release_id}`,
+					{
+						method: "PATCH",
+						body: {
+							name: a.name,
+							body,
+							tag_name: a.tag_name,
+							target_commitish: a.target_commitish,
+							prerelease: a.prerelease,
+							make_latest: a.make_latest,
+							discussion_category_name: a.discussion_category_name,
+						},
 					},
-				});
+				);
 			} catch (error) {
 				throw a.tag_name ? await explainDuplicate(error, creds, a, a.tag_name) : error;
 			}
 
-			return { untrusted_fields: RELEASE_UNTRUSTED, release: compactRelease(release, true) };
+			return {
+				untrusted_fields: RELEASE_UNTRUSTED,
+				release: compactRelease(release, true),
+				tag,
+			};
 		},
 	);
 
@@ -441,9 +501,11 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			annotations: { destructiveHint: true },
 			description:
 				"Publish a draft release. Works in two steps. Call it first WITHOUT `confirm`: " +
-				"nothing is published, and the result checks the release is ready and lists " +
-				"the workflows publishing will start. Show that to the person, then call again " +
-				"with `confirm: true` to publish. " +
+				"nothing is published, and the result checks the release is ready, lists the " +
+				"workflows publishing will start and gives a `confirm_token`. Show that to the " +
+				"person, then call again with `confirm: true` and that `confirm_token` to " +
+				"publish. If the release or the commit it would tag changes in between, the " +
+				"token stops matching and you must preview again. " +
 				TRIGGERS_WORKFLOWS +
 				" On repositories with immutable releases turned on, a published release's tag " +
 				"and assets can never be changed again.",
@@ -454,6 +516,10 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 					.boolean()
 					.default(false)
 					.describe("Leave unset to preview. true publishes."),
+				confirm_token: z
+					.string()
+					.optional()
+					.describe("The `confirm_token` from the preview. Required with confirm: true."),
 				make_latest: makeLatest,
 				...actAs,
 			},
@@ -468,16 +534,20 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				);
 			}
 
-			// The workflows that run are the ones at the commit the tag points to,
-			// so read them there rather than on the default branch.
+			// What publishing tags, resolved to a commit now: a branch target would
+			// otherwise be read again by GitHub at publish time, after the person
+			// has approved the preview.
 			const tagExists = await refExists(creds, a, `tags/${release.tag_name}`);
 			const ref = tagExists ? release.tag_name : release.target_commitish;
-			if (!tagExists && !(await commitExists(creds, a, ref))) {
+			const sha = await resolveCommit(creds, a, ref);
+			if (!sha) {
 				throw new Error(
-					`Tag ${release.tag_name} does not exist, and its target ` +
-						`${JSON.stringify(ref)} is not a branch or commit GitHub can find, so ` +
-						`there is nowhere to create the tag. Set target_commitish with ` +
-						`update_release first.`,
+					tagExists
+						? `Tag ${release.tag_name} exists but GitHub could not resolve it to a commit.`
+						: `Tag ${release.tag_name} does not exist, and its target ` +
+								`${JSON.stringify(ref)} is not a branch or commit GitHub can find, so ` +
+								`there is nowhere to create the tag. Set target_commitish with ` +
+								`update_release first.`,
 				);
 			}
 
@@ -489,28 +559,59 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				warnings.push("A prerelease cannot be marked latest; GitHub will ignore it.");
 			}
 
-			const workflows = await releaseWorkflows(creds, a, ref);
+			// The workflows that run are the ones at the commit the tag points to,
+			// so read them there rather than on the default branch.
+			const workflows = await releaseWorkflows(creds, a, sha);
 			const tag = tagExists
-				? `Uses the existing tag ${release.tag_name}.`
-				: `Creates tag ${release.tag_name} at ${ref}.`;
+				? `Uses the existing tag ${release.tag_name} (commit ${sha}).`
+				: `Creates tag ${release.tag_name} at ${sha}` +
+					(ref === sha ? "." : ` (the current head of ${ref}).`);
+			const token = await publishToken(release, sha, a.make_latest, a.act_as);
 
 			if (!a.confirm) {
 				return {
 					published: false,
 					tag,
+					target_sha: sha,
 					warnings,
 					workflows,
 					release: compactRelease(release),
+					confirm_token: token,
 					next_step:
 						"Nothing has been published. Show the person the workflows above, then " +
-						"call publish_release again with confirm: true.",
+						"call publish_release again with confirm: true and this confirm_token.",
 				};
 			}
 
-			const published = await gh<any>(creds, `${repoPath(a)}/releases/${a.release_id}`, {
-				method: "PATCH",
-				body: { draft: false, make_latest: a.make_latest },
-			});
+			if (a.confirm_token === undefined) {
+				throw new Error(
+					"confirm: true needs the confirm_token from a preview. Call publish_release " +
+						"without confirm first, show the person what it reports, then confirm " +
+						"with its token.",
+				);
+			}
+			if (a.confirm_token !== token) {
+				throw new Error(
+					`Release ${a.release_id} (${release.tag_name}) changed since the preview: ` +
+						`its notes, flags or tag, the commit it would tag, make_latest or act_as ` +
+						`differ. Nothing was published. Preview again and confirm with the new ` +
+						`token.`,
+				);
+			}
+
+			const published = await gh<GitHubRelease>(
+				creds,
+				`${repoPath(a)}/releases/${a.release_id}`,
+				{
+					method: "PATCH",
+					body: {
+						draft: false,
+						make_latest: a.make_latest,
+						// Pinned to the previewed commit, so a push in between cannot move it.
+						target_commitish: tagExists ? undefined : sha,
+					},
+				},
+			);
 
 			return {
 				published: true,
@@ -554,10 +655,11 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				);
 			}
 
-			const updated = await gh<any>(creds, `${repoPath(a)}/releases/${a.release_id}`, {
-				method: "PATCH",
-				body: { draft: true },
-			});
+			const updated = await gh<GitHubRelease>(
+				creds,
+				`${repoPath(a)}/releases/${a.release_id}`,
+				{ method: "PATCH", body: { draft: true } },
+			);
 
 			return {
 				release: compactRelease(updated),
@@ -614,10 +716,28 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 
 // ----------------------------------------------------------------- helpers
 
-type Repo = { owner: string; repo: string };
+/** A commit as the compare endpoint lists it. */
+interface GitHubCommit {
+	sha: string;
+	author?: { login: string } | null;
+	commit?: { message?: string; author?: { name?: string; date?: string } | null };
+}
 
-function getRelease(creds: TokenSource, a: Repo, id: number): Promise<any> {
-	return gh<any>(creds, `${repoPath(a)}/releases/${id}`);
+interface GitHubComparison {
+	status: string;
+	ahead_by: number;
+	behind_by: number;
+	total_commits?: number;
+	commits?: GitHubCommit[];
+	html_url: string;
+}
+
+/** An entry in a Contents API directory listing, or a file read through it. */
+interface GitHubContent {
+	type: string;
+	name: string;
+	path: string;
+	content?: string;
 }
 
 /**
@@ -625,16 +745,16 @@ function getRelease(creds: TokenSource, a: Repo, id: number): Promise<any> {
  * exactly what an agent most often asks for by tag ("the draft for v1.4.0"),
  * so a miss falls back to searching the most recent releases.
  */
-async function findReleaseByTag(creds: TokenSource, a: Repo, tag: string): Promise<any> {
+async function findReleaseByTag(creds: TokenSource, a: Repo, tag: string): Promise<GitHubRelease> {
 	try {
-		return await gh<any>(creds, `${repoPath(a)}/releases/tags/${refPath(tag)}`);
+		return await gh<GitHubRelease>(creds, `${repoPath(a)}/releases/tags/${refPath(tag)}`);
 	} catch (error) {
 		if (!(error instanceof GitHubError) || error.status !== 404) {
 			throw error;
 		}
 	}
 
-	const recent = await gh<any[]>(creds, `${repoPath(a)}/releases`, {
+	const recent = await gh<GitHubRelease[]>(creds, `${repoPath(a)}/releases`, {
 		query: { per_page: DRAFT_SEARCH_LIMIT },
 	});
 	const draft = recent.find((release) => release.tag_name === tag);
@@ -667,21 +787,62 @@ async function refExists(creds: TokenSource, a: Repo, ref: string): Promise<bool
 	}
 }
 
-/** Whether `ref` names a branch, tag or commit GitHub can resolve. */
-async function commitExists(creds: TokenSource, a: Repo, ref: string | undefined) {
+/**
+ * The commit SHA a branch, tag or SHA resolves to, or undefined if GitHub
+ * cannot find one.
+ */
+async function resolveCommit(
+	creds: TokenSource,
+	a: Repo,
+	ref: string | undefined,
+): Promise<string | undefined> {
 	if (!ref || !refName.safeParse(ref).success) {
-		return false;
+		return undefined;
 	}
 	try {
-		await gh<unknown>(creds, `${repoPath(a)}/commits/${refPath(ref)}`);
-		return true;
+		const commit = await gh<{ sha: string }>(creds, `${repoPath(a)}/commits/${refPath(ref)}`);
+		return commit.sha;
 	} catch (error) {
 		// 422 is GitHub's answer for a string that is not a ref or a SHA.
 		if (error instanceof GitHubError && (error.status === 404 || error.status === 422)) {
-			return false;
+			return undefined;
 		}
 		throw error;
 	}
+}
+
+/**
+ * Binds a publish_release confirmation to what its preview showed: the
+ * release as it stood, the commit it would tag, and the options given. Any
+ * change in between gives a different token, so a stale preview cannot be
+ * confirmed. It is a fingerprint, not a secret; the caller is already
+ * authorised to publish.
+ */
+export async function publishToken(
+	release: Pick<
+		GitHubRelease,
+		"id" | "tag_name" | "target_commitish" | "name" | "body" | "prerelease" | "updated_at"
+	>,
+	sha: string,
+	makeLatest: string | undefined,
+	actor: string,
+): Promise<string> {
+	const fingerprint = JSON.stringify([
+		release.id,
+		release.updated_at ?? null,
+		release.tag_name,
+		release.target_commitish,
+		release.name,
+		release.body,
+		release.prerelease,
+		sha,
+		makeLatest ?? null,
+		actor,
+	]);
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(fingerprint));
+	return [...new Uint8Array(digest).slice(0, 8)]
+		.map((byte) => byte.toString(16).padStart(2, "0"))
+		.join("");
 }
 
 /**
@@ -730,9 +891,9 @@ interface WorkflowReport {
  * must never stop a release from being previewed.
  */
 async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promise<WorkflowReport> {
-	let entries: any[];
+	let entries: GitHubContent[];
 	try {
-		entries = await gh<any[]>(creds, `${repoPath(a)}/contents/.github/workflows`, {
+		entries = await gh<GitHubContent[]>(creds, `${repoPath(a)}/contents/.github/workflows`, {
 			query: { ref },
 		});
 	} catch (error) {
@@ -760,7 +921,7 @@ async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promi
 	const results = await Promise.all(
 		checked.map(async (file) => {
 			try {
-				const content = await gh<any>(
+				const content = await gh<GitHubContent>(
 					creds,
 					`${repoPath(a)}/contents/${file.path.split("/").map(encodeURIComponent).join("/")}`,
 					{ query: { ref } },
@@ -796,10 +957,14 @@ async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promi
 }
 
 /**
- * Whether a workflow's top-level `on:` names `release`, in any of its three
- * forms: `on: release`, `on: [push, release]`, or a `release:` key or `- release`
- * item in the block beneath. Only the `on:` block is searched, because jobs are
- * commonly named `release:` too.
+ * Whether a workflow's top-level `on:` names the `release` event. Its forms are
+ * a scalar (`on: release`), a flow sequence (`on: [push, release]`), a flow
+ * mapping (`on: { release: { types: [published] } }`), and a block of keys or
+ * list items beneath `on:`.
+ *
+ * Only the event names directly under `on:` count. Deeper lines, such as a
+ * `- release` branch filter under `push:`, are someone else's settings, and
+ * jobs are commonly named `release:` too.
  */
 export function triggersOnRelease(yaml: string): boolean {
 	const lines = yaml.split(/\r?\n/);
@@ -808,21 +973,81 @@ export function triggersOnRelease(yaml: string): boolean {
 		return false;
 	}
 
-	const inline = lines[start].replace(/^["']?on["']?\s*:/, "").replace(/#.*$/, "");
-	if (/\brelease\b/.test(inline)) {
-		return true;
+	const inline = stripComment(lines[start].replace(/^["']?on["']?\s*:/, "")).trim();
+	if (inline) {
+		return inlineEvents(inline).includes("release");
 	}
 
-	for (const line of lines.slice(start + 1)) {
-		// The next top-level key ends the block; blank lines and comments do not.
-		if (/^\S/.test(line) && !line.startsWith("#")) {
+	// The block's events sit at the indent of its first entry. A block sequence
+	// may sit at column 0, directly under `on:`; anything else at column 0 is
+	// the next top-level key, which ends the block.
+	let indent: number | undefined;
+	for (const raw of lines.slice(start + 1)) {
+		const line = stripComment(raw).trimEnd();
+		if (!line.trim()) {
+			continue;
+		}
+		const depth = line.length - line.trimStart().length;
+		const entry = line.trimStart();
+		if (depth === 0 && !entry.startsWith("-")) {
 			break;
 		}
-		if (/^\s+(?:-\s*)?["']?release["']?\s*(?::|$)/.test(line.replace(/#.*$/, "").trimEnd())) {
+		indent ??= depth;
+		if (depth < indent) {
+			break;
+		}
+		if (depth > indent) {
+			continue;
+		}
+
+		const item = entry.match(/^-\s*(.*)$/);
+		const name = item ? item[1] : entry.match(/^(["']?[\w-]+["']?)\s*:/)?.[1];
+		if (name !== undefined && unquote(name.trim()) === "release") {
 			return true;
 		}
 	}
 	return false;
+}
+
+/** The event names in an inline `on:` value: a scalar, `[a, b]` or `{ a: …, b: … }`. */
+function inlineEvents(value: string): string[] {
+	if (value.startsWith("[")) {
+		return topLevelEntries(value.slice(1, value.lastIndexOf("]")));
+	}
+	if (value.startsWith("{")) {
+		return topLevelEntries(value.slice(1, value.lastIndexOf("}"))).map((entry) =>
+			unquote(entry.split(":", 1)[0].trim()),
+		);
+	}
+	return [unquote(value)];
+}
+
+/** Splits a flow collection's contents on the commas that are not nested inside it. */
+function topLevelEntries(body: string): string[] {
+	const entries: string[] = [];
+	let depth = 0;
+	let current = "";
+	for (const char of body) {
+		if (char === "[" || char === "{") depth++;
+		if (char === "]" || char === "}") depth--;
+		if (char === "," && depth === 0) {
+			entries.push(current);
+			current = "";
+		} else {
+			current += char;
+		}
+	}
+	entries.push(current);
+	return entries.map((entry) => unquote(entry.trim())).filter(Boolean);
+}
+
+function unquote(value: string): string {
+	return value.replace(/^(["'])(.*)\1$/, "$2");
+}
+
+/** Drops a trailing YAML comment: a `#` at the start or after whitespace. */
+function stripComment(line: string): string {
+	return line.replace(/(^|\s)#.*$/, "");
 }
 
 function workflowName(yaml: string): string | undefined {
@@ -845,7 +1070,7 @@ function firstLine(message: string | undefined): string | undefined {
  * merge, and `Merge pull request #123 from …` from a merge commit. A rebase
  * merge leaves no trace in the message, so those PRs are not found.
  */
-function pullRequestNumbers(commits: any[]): number[] {
+export function pullRequestNumbers(commits: GitHubCommit[]): number[] {
 	const found = new Set<number>();
 	for (const commit of commits) {
 		const line = firstLine(commit.commit?.message) ?? "";

@@ -3,14 +3,11 @@
  * release can still take files, finding an asset on it, and the upload itself.
  */
 
-import { type TokenSource, gh, ghUpload, seg } from "../github/client";
-
-type Repo = { owner: string; repo: string };
+import { type Repo, type TokenSource, gh, ghUpload, repoPath } from "../github/client";
+import type { GitHubRelease, GitHubReleaseAsset } from "../github/releases";
 
 /** How many pages of assets `findAsset` reads before giving up. */
 const MAX_ASSET_PAGES = 10;
-
-const repoPath = (a: Repo) => `/repos/${seg(a.owner)}/${seg(a.repo)}`;
 
 /**
  * Asset names as GitHub stores them. GitHub quietly swaps some characters for
@@ -35,27 +32,6 @@ export function assetNameProblem(name: string): string | undefined {
 }
 
 /**
- * Fetches a release and refuses one whose assets are locked: GitHub does not
- * let anything change on a published release in a repository with immutable
- * releases turned on.
- */
-export async function getMutableRelease(
-	creds: TokenSource,
-	a: Repo,
-	releaseId: number,
-): Promise<any> {
-	const release = await gh<any>(creds, `${repoPath(a)}/releases/${releaseId}`);
-	if (release.immutable && !release.draft) {
-		throw new Error(
-			`Release ${releaseId} (${release.tag_name}) is immutable: the repository locks ` +
-				`releases once they are published, so its assets cannot be added, renamed or ` +
-				`deleted. Attach files to a draft before publishing it.`,
-		);
-	}
-	return release;
-}
-
-/**
  * Finds an asset on a release by id or by name. A release's own `assets` array
  * is checked first; the paged list is read only if that misses, in case GitHub
  * cut the array short.
@@ -63,10 +39,10 @@ export async function getMutableRelease(
 export async function findAsset(
 	creds: TokenSource,
 	a: Repo,
-	release: any,
+	release: GitHubRelease,
 	match: { id?: number; name?: string },
-): Promise<any | undefined> {
-	const matches = (asset: any) =>
+): Promise<GitHubReleaseAsset | undefined> {
+	const matches = (asset: GitHubReleaseAsset) =>
 		(match.id !== undefined && asset.id === match.id) ||
 		(match.name !== undefined && asset.name === match.name);
 
@@ -76,9 +52,13 @@ export async function findAsset(
 	}
 
 	for (let page = 1; page <= MAX_ASSET_PAGES; page++) {
-		const assets = await gh<any[]>(creds, `${repoPath(a)}/releases/${release.id}/assets`, {
-			query: { per_page: 100, page },
-		});
+		const assets = await gh<GitHubReleaseAsset[]>(
+			creds,
+			`${repoPath(a)}/releases/${release.id}/assets`,
+			{
+				query: { per_page: 100, page },
+			},
+		);
 		const found = assets.find(matches);
 		if (found || assets.length < 100) {
 			return found;
@@ -91,7 +71,7 @@ export async function findAsset(
 export async function assertNameFree(
 	creds: TokenSource,
 	a: Repo,
-	release: any,
+	release: GitHubRelease,
 	name: string,
 ): Promise<void> {
 	const existing = await findAsset(creds, a, release, { name });
@@ -108,8 +88,8 @@ export function uploadAsset(
 	creds: TokenSource,
 	a: Repo & { releaseId: number; name: string; label?: string },
 	body: { data: ReadableStream<Uint8Array> | Uint8Array; length: number; contentType: string },
-): Promise<any> {
-	return ghUpload<any>(
+): Promise<GitHubReleaseAsset> {
+	return ghUpload<GitHubReleaseAsset>(
 		creds,
 		`${repoPath(a)}/releases/${a.releaseId}/assets`,
 		{ name: a.name, label: a.label },
