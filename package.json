@@ -15,7 +15,7 @@
     "db:migrate:local": "wrangler d1 migrations apply github-issues-mcp --local"
   },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "^0.8.2",
+    "@cloudflare/workers-oauth-provider": "^1.2.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "agents": "^0.17.1",
     "zod": "^4.4.3"
