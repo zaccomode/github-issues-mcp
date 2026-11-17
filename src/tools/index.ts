@@ -16,6 +16,7 @@ import {
 	scrub,
 	withClosingKeywords,
 } from "./common";
+import { registerReleaseTools } from "./releases";
 import { registerSecurityTools } from "./security";
 
 /**
@@ -42,7 +43,7 @@ const CLOSING_ISSUES_QUERY = `
 export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 	const server = new McpServer({
 		name: "github-issues",
-		version: "2.0.0",
+		version: "2.1.0",
 	});
 
 	/** Wraps a handler so GitHub failures surface as tool errors, not exceptions. */
@@ -452,7 +453,7 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 			annotations: { destructiveHint: false },
 			description:
 				"Open a pull request for a branch that has already been pushed to GitHub. This " +
-				"server cannot push code — commit and push with git first, then call this. Use " +
+				"server has no tool that pushes code — commit and push with git first, then call this. Use " +
 				"`closes` to link the pull request to the issues it resolves.",
 			inputSchema: {
 				...repoShape,
@@ -711,6 +712,7 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 	// ---------------------------------------------------------------- security
 
 	registerSecurityTools(register, ctx);
+	registerReleaseTools(register, ctx);
 
 	return server;
 }

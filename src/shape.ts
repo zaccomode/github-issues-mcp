@@ -271,3 +271,50 @@ export function compactRepositoryAdvisory(advisory: any, detail = false) {
 			: {}),
 	};
 }
+
+// ------------------------------------------------------------------ releases
+
+/**
+ * A release, with its notes and asset details only when `detail` is set —
+ * listings stay small, and get_release carries the rest.
+ */
+export function compactRelease(release: any, detail = false) {
+	const assets = release.assets ?? [];
+	return {
+		id: release.id,
+		tag_name: release.tag_name,
+		name: release.name ?? undefined,
+		draft: release.draft,
+		prerelease: release.prerelease,
+		// Only repositories with immutable releases turned on report this as true.
+		immutable: release.immutable === true ? true : undefined,
+		target_commitish: release.target_commitish,
+		author: login(release.author),
+		author_is_bot: release.author?.type === "Bot" ? true : undefined,
+		created_at: release.created_at,
+		published_at: release.published_at ?? undefined,
+		url: release.html_url,
+		...(detail
+			? {
+					body: release.body ?? undefined,
+					assets: assets.map(compactReleaseAsset),
+				}
+			: { asset_count: assets.length }),
+	};
+}
+
+export function compactReleaseAsset(asset: any) {
+	return {
+		id: asset.id,
+		name: asset.name,
+		label: asset.label || undefined,
+		size: asset.size,
+		content_type: asset.content_type,
+		download_count: asset.download_count,
+		state: asset.state,
+		uploader: login(asset.uploader),
+		created_at: asset.created_at,
+		updated_at: asset.updated_at,
+		url: asset.browser_download_url,
+	};
+}
