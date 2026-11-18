@@ -1,12 +1,14 @@
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppEnv } from "../src/env";
+import { handleUpload } from "../src/uploads/handler";
 import {
 	LINK_TTL_SECONDS,
 	type NewUploadLink,
 	claimUploadLink,
 	createUploadLink,
 	sweepUploadLinks,
+	uploadLinkId,
 } from "../src/uploads/links";
 
 const appEnv = env as unknown as AppEnv;
@@ -123,5 +125,61 @@ describe("upload links", () => {
 		const { secret } = await createUploadLink(appEnv, link());
 		await sweepUploadLinks(appEnv);
 		expect((await rowFor(secret))?.sealed_token).toBeTypeOf("string");
+	});
+});
+
+describe("upload handler", () => {
+	beforeEach(async () => {
+		vi.useRealTimers();
+		await env.DB.prepare(`DELETE FROM upload_links`).run();
+	});
+
+	const put = (path: string, headers: Record<string, string> = {}) =>
+		handleUpload(
+			new Request(`https://mcp.example${path}`, {
+				method: "PUT",
+				headers: { "Content-Length": "5", ...headers },
+				body: "hello",
+			}),
+			appEnv,
+		);
+
+	it("puts only the link's id in the URL", async () => {
+		const { id, secret } = await createUploadLink(appEnv, link());
+		expect(id).toMatch(/^[0-9a-f]{64}$/);
+		expect(id).toBe(await uploadLinkId(secret));
+		expect(id).not.toContain(secret);
+	});
+
+	it("refuses the URL alone without spending the link", async () => {
+		const { id, secret } = await createUploadLink(appEnv, link());
+		const response = await put(`/uploads/${id}`);
+		expect(response.status).toBe(401);
+		expect(response.headers.get("WWW-Authenticate")).toMatch(/^Bearer/);
+		expect((await rowFor(secret))?.used_at).toBeNull();
+	});
+
+	it("refuses another link's secret without spending either", async () => {
+		const first = await createUploadLink(appEnv, link());
+		const second = await createUploadLink(appEnv, link());
+		const response = await put(`/uploads/${first.id}`, {
+			Authorization: `Bearer ${second.secret}`,
+		});
+		expect(response.status).toBe(404);
+		expect((await rowFor(first.secret))?.used_at).toBeNull();
+		expect((await rowFor(second.secret))?.used_at).toBeNull();
+	});
+
+	it("refuses an old-style link with the secret in the path", async () => {
+		const { secret } = await createUploadLink(appEnv, link());
+		const response = await put(`/uploads/${secret}`);
+		expect(response.status).toBe(410);
+		expect((await rowFor(secret))?.used_at).toBeNull();
+	});
+
+	it("claims the link when the secret comes in the header", async () => {
+		const { id, secret } = await createUploadLink(appEnv, link());
+		await put(`/uploads/${id}`, { Authorization: `Bearer ${secret}` });
+		expect((await rowFor(secret))?.used_at).toBeTypeOf("number");
 	});
 });
