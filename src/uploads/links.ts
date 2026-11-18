@@ -8,11 +8,13 @@
  * sends the file from its shell with curl, and src/uploads/handler.ts streams
  * it on to GitHub as whichever identity the link was made for.
  *
- * A link is a bearer secret, so only its hash is stored. For act_as "user" the
- * person's token has to survive until the upload arrives, and it is sealed
- * with a key derived from both the link and a Worker secret. Neither the row
- * nor the URL alone, which turns up in request logs and shell history, can be
- * turned into a GitHub credential, which keeps the promise that D1 holds none.
+ * A link is a bearer secret, so only its hash is stored. The secret travels in
+ * the upload's `Authorization: Bearer` header, never in the URL: the URL holds
+ * only that hash, the link's id, because request URLs end up in Workers Logs.
+ * For act_as "user" the person's token has to survive until the upload
+ * arrives, and it is sealed with a key derived from both the secret and a
+ * Worker secret. Neither the row nor the URL can be turned into a GitHub
+ * credential or used to upload, which keeps the promise that D1 holds none.
  * The sealed token is cleared as soon as the link is claimed, and from every
  * row once its link has expired.
  *
@@ -85,11 +87,14 @@ interface Row {
 	used_at: number | null;
 }
 
-/** Stores a new link and returns its secret, the last path segment of the URL. */
+/**
+ * Stores a new link and returns its secret, sent as the upload's bearer token,
+ * and its id, the last path segment of the URL.
+ */
 export async function createUploadLink(
 	env: AppEnv,
 	link: NewUploadLink,
-): Promise<{ secret: string; expiresAt: number }> {
+): Promise<{ id: string; secret: string; expiresAt: number }> {
 	if (link.actor === "user" && !link.userToken) {
 		throw new Error("An upload link acting as the user needs the user's token.");
 	}
@@ -98,6 +103,7 @@ export async function createUploadLink(
 	const now = Math.floor(Date.now() / 1000);
 	const expiresAt = now + LINK_TTL_SECONDS;
 	const sealed = link.actor === "user" ? await seal(env, secret, link.userToken!) : null;
+	const id = await uploadLinkId(secret);
 
 	await env.DB.prepare(
 		`INSERT INTO upload_links (id, installation_id, account_login, actor, user_login,
@@ -106,7 +112,7 @@ export async function createUploadLink(
 		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)`,
 	)
 		.bind(
-			await linkId(secret),
+			id,
 			link.installationId,
 			link.accountLogin,
 			link.actor,
@@ -125,7 +131,7 @@ export async function createUploadLink(
 		)
 		.run();
 
-	return { secret, expiresAt };
+	return { id, secret, expiresAt };
 }
 
 export type ClaimResult =
@@ -139,7 +145,7 @@ export type ClaimResult =
  * lives only in this request.
  */
 export async function claimUploadLink(env: AppEnv, secret: string): Promise<ClaimResult> {
-	const id = await linkId(secret);
+	const id = await uploadLinkId(secret);
 	const now = Math.floor(Date.now() / 1000);
 
 	const row = await env.DB.prepare(
@@ -231,7 +237,8 @@ export async function sweepUploadLinks(env: AppEnv): Promise<void> {
 
 const encoder = new TextEncoder();
 
-async function linkId(secret: string): Promise<string> {
+/** A link's id: the hex SHA-256 of its secret. Not secret; it names the row. */
+export async function uploadLinkId(secret: string): Promise<string> {
 	const digest = await crypto.subtle.digest("SHA-256", encoder.encode(secret));
 	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }

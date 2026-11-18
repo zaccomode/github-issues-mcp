@@ -9,16 +9,29 @@
 # workflow, because an App's token triggers workflows and Actions' own
 # GITHUB_TOKEN does not. `publish_release` lists it in its preview.
 #
+# It runs on `released`, which GitHub sends both when a release is published
+# and when a prerelease is later promoted to a full release; `published` alone
+# would miss the promotion. Prereleases don't deploy.
+#
+# The checks run in their own job, with no environment and no secrets, because
+# `npm ci` there runs dependencies' install scripts. The deploy job installs
+# afresh with --ignore-scripts, so nothing a dependency runs at install time
+# shares a job with CLOUDFLARE_API_TOKEN.
+#
 # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID live in the `production`
 # environment, which only allows `v*` tags, so no pull request or branch run can
-# read them. Run it by hand from a tag ("Use workflow from") to redeploy that
-# release, e.g. to roll back. Migrations don't roll back, so only do that when
-# the older code works against the newer schema.
+# read them. The checks above come from this file at the tagged commit, so they
+# only hold if creating `v*` tags is limited to admins (a tag ruleset) or the
+# environment requires a reviewer; see the README's deploy section.
+#
+# Run it by hand from a tag ("Use workflow from") to redeploy that release,
+# e.g. to roll back. Migrations don't roll back, so only do that when the older
+# code works against the newer schema.
 name: Deploy
 
 on:
     release:
-        types: [published]
+        types: [released]
     workflow_dispatch:
 
 permissions:
@@ -31,11 +44,10 @@ concurrency:
     cancel-in-progress: false
 
 jobs:
-    deploy:
+    check:
         if: ${{ github.event_name != 'release' || !github.event.release.prerelease }}
         runs-on: ubuntu-latest
         timeout-minutes: 15
-        environment: production
         steps:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
@@ -69,6 +81,25 @@ jobs:
             - run: npm ci
             - run: npm run check
             - run: npm test
+
+    deploy:
+        needs: check
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        environment: production
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            # No npm cache here: the check job's install could have written to it.
+            - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+              with:
+                  node-version: 22
+
+            # wrangler needs no install scripts: esbuild and workerd ship their
+            # binaries as optional platform packages.
+            - run: npm ci --ignore-scripts
 
             - run: npm run deploy
               env:

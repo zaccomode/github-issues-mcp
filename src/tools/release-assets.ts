@@ -117,7 +117,7 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 			await assertNameFree(creds, a, release, a.name);
 
 			const type = a.content_type ?? guessContentType(a.name);
-			const { secret, expiresAt } = await createUploadLink(ctx.env, {
+			const { id, secret, expiresAt } = await createUploadLink(ctx.env, {
 				grant: ctx.tenant.grant,
 				installationId: ctx.tenant.installationId,
 				accountLogin: ctx.tenant.accountLogin,
@@ -133,10 +133,11 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 			});
 			ctx.waitUntil(sweepUploadLinks(ctx.env));
 
-			const url = `${publicUrl(ctx.env)}${UPLOAD_PATH_PREFIX}${secret}`;
+			const url = `${publicUrl(ctx.env)}${UPLOAD_PATH_PREFIX}${id}`;
 			return {
 				upload_url: url,
 				method: "PUT",
+				authorization: `Bearer ${secret}`,
 				expires_at: new Date(expiresAt * 1000).toISOString(),
 				expires_in_seconds: LINK_TTL_SECONDS,
 				max_bytes: MAX_LINK_UPLOAD_BYTES,
@@ -145,13 +146,15 @@ export function registerReleaseAssetTools(register: Register, ctx: ToolContext) 
 				release: { id: release.id, tag_name: release.tag_name, draft: release.draft },
 				curl_command:
 					`curl -sS --fail-with-body --upload-file <path> ` +
+					`-H ${shellQuote(`Authorization: Bearer ${secret}`)} ` +
 					`-H ${shellQuote(`Content-Type: ${type}`)} ${shellQuote(url)}`,
 				notes: [
 					"Replace <path> with the file's path. The link takes one file, once.",
 					"--fail-with-body needs curl 7.76 or later. On older curl, drop it and " +
 						"read the JSON it prints instead.",
-					`The link works without any other credentials, so treat it as a secret ` +
-						`until it is used or expires.`,
+					`The Authorization header works without any other credentials, so treat ` +
+						`it as a secret until the link is used or expires. The URL alone ` +
+						`cannot upload anything.`,
 				],
 			};
 		},

@@ -1,9 +1,10 @@
 /**
  * Receives a file sent to an upload link and streams it on to GitHub.
  *
- * Reached without an MCP token: the link's secret is the only authorisation,
- * which is why it is single-use, short-lived and bound to one release and one
- * asset name when it is made. Everything about where the file goes and who it
+ * Reached without an MCP token: the link's secret, sent as a bearer token, is
+ * the only authorisation, which is why it is single-use, short-lived and bound
+ * to one release and one asset name when it is made. The URL carries only the
+ * link's id, so request logs never hold a usable link. Everything about where the file goes and who it
  * is uploaded as comes from the stored link, never from this request.
  *
  * Answers are JSON for an agent reading curl's output, so every failure says
@@ -19,7 +20,7 @@ import { compactReleaseAsset } from "../shape";
 import { scrub } from "../tools/common";
 import { getMutableRelease } from "../github/releases";
 import { isContentType, uploadAsset } from "./assets";
-import { type ClaimedUploadLink, UPLOAD_PATH_PREFIX, claimUploadLink } from "./links";
+import { type ClaimedUploadLink, UPLOAD_PATH_PREFIX, claimUploadLink, uploadLinkId } from "./links";
 
 /**
  * Cloudflare refuses request bodies over 100 MB on the Free and Pro plans
@@ -60,9 +61,35 @@ async function receive(request: Request, env: AppEnv): Promise<Response> {
 		);
 	}
 
-	const secret = new URL(request.url).pathname.slice(UPLOAD_PATH_PREFIX.length);
-	if (!/^[A-Za-z0-9_-]{43}$/.test(secret)) {
+	const id = new URL(request.url).pathname.slice(UPLOAD_PATH_PREFIX.length);
+	if (/^[A-Za-z0-9_-]{43}$/.test(id)) {
+		// A link from before secrets moved out of the URL. It expires within
+		// fifteen minutes of being made, and accepting it would keep the old hole.
+		return reply(410, {
+			error: `This upload link uses a format this server no longer accepts. ${NEW_LINK}`,
+		});
+	}
+	if (!/^[0-9a-f]{64}$/.test(id)) {
 		return reply(404, { error: `This is not an upload link. ${NEW_LINK}` });
+	}
+
+	const secret = request.headers.get("authorization")?.match(/^Bearer\s+(\S+)\s*$/i)?.[1];
+	if (secret === undefined || !/^[A-Za-z0-9_-]{43}$/.test(secret)) {
+		return reply(
+			401,
+			{
+				error:
+					"The upload needs the link's secret in an `Authorization: Bearer` header. " +
+					"Use the curl_command create_release_asset_upload returned. The link has " +
+					"not been used.",
+			},
+			{ "WWW-Authenticate": 'Bearer realm="upload link"' },
+		);
+	}
+	if ((await uploadLinkId(secret)) !== id) {
+		return reply(404, {
+			error: `The secret does not belong to this upload link. ${NEW_LINK}`,
+		});
 	}
 
 	// Everything that can be checked without spending the link is checked first.

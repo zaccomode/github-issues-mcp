@@ -88,7 +88,10 @@ delete releases, and manage the files attached to them.
 - **Publishing takes two calls.** `publish_release` without `confirm` publishes
   nothing: it checks the release is ready, resolves the commit it would tag,
   lists the workflows in `.github/workflows/` that run `on: release`, and returns
-  a `confirm_token`. Calling it again with `confirm: true` and that token
+  a `confirm_token`. If the tag doesn't exist yet, publishing creates it, so the
+  preview also lists the `create` workflows and `push` workflows that run on
+  tags, under `triggered_by_tag_creation`. A draft whose tag is GitHub's
+  `untagged-…` placeholder is refused. Calling it again with `confirm: true` and that token
   publishes, with the tag pinned to the previewed commit. If the release, its
   target or the branch head changed in between, the token no longer matches and
   nothing is published. This matters because a release published with an
@@ -102,7 +105,9 @@ delete releases, and manage the files attached to them.
   releases with `allow_published: true`, and leaves the tag in place.
 - **Tags must be explicit.** If a tag doesn't exist yet, `create_release` and
   `update_release` need `target_commitish`; otherwise GitHub would tag whatever
-  the default branch points at.
+  the default branch points at. On a draft, `update_release` always sends the
+  current tag back, because GitHub otherwise resets a draft's not-yet-created
+  tag to an `untagged-…` placeholder.
 - **Published releases need `allow_published`.** `update_release` changes drafts
   only, unless given `allow_published: true`. On a published release, a new
   `tag_name` creates that tag at once, and any edit starts `release: edited`
@@ -120,8 +125,12 @@ it on to GitHub as the chosen `act_as` identity, without buffering it:
 
 ```bash
 curl -sS --fail-with-body --upload-file ./dist/app.zip \
+  -H "Authorization: Bearer $UPLOAD_SECRET" \
   -H 'Content-Type: application/zip' "$UPLOAD_URL"
 ```
+
+The URL names the link; the secret in the `Authorization` header is what
+lets the upload through, so a URL seen in a log can't be replayed.
 
 - **One file per link, up to 100 MB,** which is Cloudflare's request body limit
   on the Free and Pro plans. Larger files need a Business or Enterprise zone.
@@ -210,7 +219,7 @@ After that, publishing a release deploys. Bump `version` in `package.json` on
 `main`, then publish a release tagged `v<version>` (e.g. `v2.3.0`) from `main`,
 by hand or with `publish_release`. The Deploy workflow checks the tag is on
 `main` and matches `package.json`, runs the same checks as CI, then runs
-`npm run deploy`. Pre-releases don't deploy. To redeploy an older release, run
+`npm run deploy`. Pre-releases don't deploy until they are promoted to a full release. To redeploy an older release, run
 the Deploy workflow by hand from its tag; migrations don't roll back, so only
 when that code works with the newer schema.
 
@@ -218,6 +227,19 @@ The workflow needs a GitHub environment named `production`, with deployment
 tags limited to `v*`, holding two secrets: `CLOUDFLARE_ACCOUNT_ID`, and
 `CLOUDFLARE_API_TOKEN` with Workers Scripts, Workers KV Storage and D1 edit on
 the account.
+
+The tag-on-`main` and version checks are read from `deploy.yml` at the tagged
+commit, so anyone who can push a `v*` tag could tag a branch whose workflow
+skips them. Close that gap with one of:
+
+- a tag ruleset (Settings → Rules → Rulesets, target tags matching `v*`) that
+  restricts creating, updating and deleting them to repository admins; or
+- a required reviewer on the `production` environment, so every deploy waits
+  for approval.
+
+The checks and tests run in a job with no secrets. The deploy job installs with
+`npm ci --ignore-scripts`, so a dependency's install script never runs beside
+`CLOUDFLARE_API_TOKEN`.
 
 ## Local development
 
@@ -245,7 +267,7 @@ CI runs both on every pull request.
 
 **Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
 
-**Upload links** are stored in D1 rather than KV, because only D1's `UPDATE … WHERE used_at IS NULL` can stop a link being used twice. Only the link's SHA-256 is stored. A link made with `act_as: "user"` has to carry the person's token until the file arrives, so the token is encrypted with a key derived from both the link and the Worker's `GITHUB_CLIENT_SECRET`: neither the row nor the URL, which turns up in logs, can be turned back into a credential on its own. The sealed token is cleared the moment the link is claimed, and from any link that expires unused. Each link also records the OAuth grant that made it, and the upload is refused if that grant has been revoked since.
+**Upload links** are stored in D1 rather than KV, because only D1's `UPDATE … WHERE used_at IS NULL` can stop a link being used twice. Only the link's SHA-256 is stored. The link's secret is sent in the upload's `Authorization: Bearer` header; the URL carries only its SHA-256, so the request URLs Workers Logs records can't be replayed. A link made with `act_as: "user"` has to carry the person's token until the file arrives, so the token is encrypted with a key derived from both the secret and the Worker's `GITHUB_CLIENT_SECRET`: neither the row nor the URL can be turned back into a credential. The sealed token is cleared the moment the link is claimed, and from any link that expires unused. Each link also records the OAuth grant that made it, and the upload is refused if that grant has been revoked since.
 
 **Why refresh only happens in `tokenExchangeCallback`.** Using a GitHub refresh
 token invalidates the previous pair, and an API request has no way to write
