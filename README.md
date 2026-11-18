@@ -206,6 +206,19 @@ npm run deploy
 
 Add `https://<your-host>/mcp` to any MCP client.
 
+After that, publishing a release deploys. Bump `version` in `package.json` on
+`main`, then publish a release tagged `v<version>` (e.g. `v2.3.0`) from `main`,
+by hand or with `publish_release`. The Deploy workflow checks the tag is on
+`main` and matches `package.json`, runs the same checks as CI, then runs
+`npm run deploy`. Pre-releases don't deploy. To redeploy an older release, run
+the Deploy workflow by hand from its tag; migrations don't roll back, so only
+when that code works with the newer schema.
+
+The workflow needs a GitHub environment named `production`, with deployment
+tags limited to `v*`, holding two secrets: `CLOUDFLARE_ACCOUNT_ID`, and
+`CLOUDFLARE_API_TOKEN` with Workers Scripts, Workers KV Storage and D1 edit on
+the account.
+
 ## Local development
 
 Copy `.dev.vars.example` to `.dev.vars` and fill it in. Register a **separate dev
