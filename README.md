@@ -88,7 +88,10 @@ delete releases, and manage the files attached to them.
 - **Publishing takes two calls.** `publish_release` without `confirm` publishes
   nothing: it checks the release is ready, resolves the commit it would tag,
   lists the workflows in `.github/workflows/` that run `on: release`, and returns
-  a `confirm_token`. Calling it again with `confirm: true` and that token
+  a `confirm_token`. If the tag doesn't exist yet, publishing creates it, so the
+  preview also lists the `create` workflows and `push` workflows that run on
+  tags, under `triggered_by_tag_creation`. A draft whose tag is GitHub's
+  `untagged-…` placeholder is refused. Calling it again with `confirm: true` and that token
   publishes, with the tag pinned to the previewed commit. If the release, its
   target or the branch head changed in between, the token no longer matches and
   nothing is published. This matters because a release published with an
@@ -102,7 +105,9 @@ delete releases, and manage the files attached to them.
   releases with `allow_published: true`, and leaves the tag in place.
 - **Tags must be explicit.** If a tag doesn't exist yet, `create_release` and
   `update_release` need `target_commitish`; otherwise GitHub would tag whatever
-  the default branch points at.
+  the default branch points at. On a draft, `update_release` always sends the
+  current tag back, because GitHub otherwise resets a draft's not-yet-created
+  tag to an `untagged-…` placeholder.
 - **Published releases need `allow_published`.** `update_release` changes drafts
   only, unless given `allow_published: true`. On a published release, a new
   `tag_name` creates that tag at once, and any edit starts `release: edited`

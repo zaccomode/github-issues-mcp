@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { publishToken, pullRequestNumbers, triggersOnRelease } from "../src/tools/releases";
+import {
+	isPlaceholderTag,
+	publishToken,
+	pullRequestNumbers,
+	releasePatch,
+	triggersOnRelease,
+	triggersOnTagCreation,
+} from "../src/tools/releases";
 
 describe("triggersOnRelease", () => {
 	const runs = (yaml: string) => triggersOnRelease(yaml.replace(/^\n/, ""));
@@ -16,6 +23,9 @@ describe("triggersOnRelease", () => {
 		["a block list at column 0", "on:\n- push\n- release\njobs: {}\n"],
 		["a comment between entries", "on:\n  push:\n  # the next one\n  release:\n"],
 		["a trailing comment", "on: release # publish\n"],
+		["a flow sequence over two lines", "on: [push,\n  release]\njobs: {}\n"],
+		["a flow mapping over three lines", "on: {\n  release: { types: [published] }\n}\n"],
+		["a leading byte order mark", "\uFEFFon: release\n"],
 	])("matches %s", (_, yaml) => {
 		expect(runs(yaml)).toBe(true);
 	});
@@ -32,6 +42,78 @@ describe("triggersOnRelease", () => {
 		["an inline comment naming it", "on: push # not release\n"],
 	])("ignores %s", (_, yaml) => {
 		expect(runs(yaml)).toBe(false);
+	});
+});
+
+describe("triggersOnTagCreation", () => {
+	const runs = (yaml: string) => triggersOnTagCreation(yaml.replace(/^\n/, ""));
+
+	it.each([
+		["a block tag filter", "on:\n  push:\n    tags: ['v*']\n"],
+		["a tags-ignore filter", "on:\n  push:\n    tags-ignore:\n      - nightly\n"],
+		["a flow tag filter", "on: { push: { tags: [v*] } }\n"],
+		["branches and tags", "on:\n  push:\n    branches: [main]\n    tags: [v*]\n"],
+		["a bare push", "on: push\n"],
+		["a bare push in a list", "on: [push, pull_request]\n"],
+		["a push with only paths", "on:\n  push:\n    paths: [src/**]\n"],
+		["a create event", "on: [create]\n"],
+		["a multi-line flow push", "on: {\n  push: { tags: [v*] }\n}\n"],
+	])("matches %s", (_, yaml) => {
+		expect(runs(yaml)).toBe(true);
+	});
+
+	it.each([
+		["a branch-only push", "on:\n  push:\n    branches: [main]\n"],
+		["a branches-ignore push", "on:\n  push:\n    branches-ignore: [wip]\n"],
+		["a flow branch-only push", "on: { push: { branches: [main] } }\n"],
+		["a release only", "on:\n  release:\n    types: [published]\n"],
+		["a job filter named tags", "on:\n  push:\n    branches: [main]\njobs:\n  tags:\n"],
+	])("ignores %s", (_, yaml) => {
+		expect(runs(yaml)).toBe(false);
+	});
+});
+
+describe("releasePatch", () => {
+	const draft = { draft: true, tag_name: "v2.4.0", target_commitish: "main" };
+
+	it("keeps a draft's tag when only the body changes", () => {
+		const { patch, warning } = releasePatch(draft, { body: "notes" });
+		expect(patch).toMatchObject({
+			body: "notes",
+			tag_name: "v2.4.0",
+			target_commitish: "main",
+		});
+		expect(warning).toBeUndefined();
+	});
+
+	it("keeps a draft's tag when only target_commitish changes", () => {
+		const { patch } = releasePatch(draft, { target_commitish: "abc123" });
+		expect(patch).toMatchObject({ tag_name: "v2.4.0", target_commitish: "abc123" });
+	});
+
+	it("sends a new tag as given", () => {
+		const { patch } = releasePatch(draft, { tag_name: "v3.0.0", target_commitish: "dev" });
+		expect(patch).toMatchObject({ tag_name: "v3.0.0", target_commitish: "dev" });
+	});
+
+	it("leaves a published release's tag alone", () => {
+		const { patch } = releasePatch({ ...draft, draft: false }, { body: "notes" });
+		expect(patch.tag_name).toBeUndefined();
+		expect(patch.target_commitish).toBeUndefined();
+	});
+
+	it("warns rather than re-sending a placeholder tag", () => {
+		const { patch, warning } = releasePatch(
+			{ ...draft, tag_name: "untagged-24962f94d18b366c8863" },
+			{ body: "notes" },
+		);
+		expect(patch.tag_name).toBeUndefined();
+		expect(warning).toMatch(/no tag/);
+	});
+
+	it("recognises placeholder tags", () => {
+		expect(isPlaceholderTag("untagged-8ed02a1b9605b4006bbf")).toBe(true);
+		expect(isPlaceholderTag("v2.3.0")).toBe(false);
 	});
 });
 

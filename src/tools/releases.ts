@@ -75,7 +75,9 @@ export const releaseId = z.number().int().positive().describe("The release's num
 
 const TRIGGERS_WORKFLOWS =
 	"Publishing notifies everyone watching the repository, and starts any workflow that " +
-	"runs `on: release` — deploys and package publishes often do. That happens under " +
+	"runs `on: release` — deploys and package publishes often do. When the tag does not " +
+	"exist yet, publishing also creates it, which starts `create` workflows and `push` " +
+	"workflows that run on tags; the preview lists those separately. That happens under " +
 	"either act_as: a token from a GitHub App starts workflows, unlike Actions' own " +
 	"GITHUB_TOKEN.";
 
@@ -465,23 +467,14 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				body = base.trim() ? `${base.trimEnd()}\n\n${a.body_append}` : a.body_append;
 			}
 
+			const { patch, warning } = releasePatch(current, { ...a, body });
+
 			let release: GitHubRelease;
 			try {
 				release = await gh<GitHubRelease>(
 					creds,
 					`${repoPath(a)}/releases/${a.release_id}`,
-					{
-						method: "PATCH",
-						body: {
-							name: a.name,
-							body,
-							tag_name: a.tag_name,
-							target_commitish: a.target_commitish,
-							prerelease: a.prerelease,
-							make_latest: a.make_latest,
-							discussion_category_name: a.discussion_category_name,
-						},
-					},
+					{ method: "PATCH", body: patch },
 				);
 			} catch (error) {
 				throw a.tag_name ? await explainDuplicate(error, creds, a, a.tag_name) : error;
@@ -491,6 +484,7 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				untrusted_fields: RELEASE_UNTRUSTED,
 				release: compactRelease(release, true),
 				tag,
+				warning,
 			};
 		},
 	);
@@ -533,6 +527,14 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 					`Release ${a.release_id} (${release.tag_name}) is already published.`,
 				);
 			}
+			if (isPlaceholderTag(release.tag_name)) {
+				throw new Error(
+					`Release ${a.release_id} has no tag: ${release.tag_name} is GitHub's placeholder ` +
+						`for a draft whose tag was lost. Publishing it would create a tag with that ` +
+						`name. Set the real tag with update_release (tag_name, plus target_commitish ` +
+						`if the tag does not exist yet) first.`,
+				);
+			}
 
 			// What publishing tags, resolved to a commit now: a branch target would
 			// otherwise be read again by GitHub at publish time, after the person
@@ -561,7 +563,7 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 
 			// The workflows that run are the ones at the commit the tag points to,
 			// so read them there rather than on the default branch.
-			const workflows = await releaseWorkflows(creds, a, sha);
+			const workflows = await releaseWorkflows(creds, a, sha, !tagExists);
 			const tag = tagExists
 				? `Uses the existing tag ${release.tag_name} (commit ${sha}).`
 				: `Creates tag ${release.tag_name} at ${sha}` +
@@ -875,9 +877,66 @@ async function explainDuplicate(
 	);
 }
 
+/** GitHub's stand-in tag name for a draft whose tag was never set or was lost. */
+export function isPlaceholderTag(tag: string): boolean {
+	return tag.startsWith("untagged-");
+}
+
+type ReleaseEdit = {
+	name?: string;
+	body?: string;
+	tag_name?: string;
+	target_commitish?: string;
+	prerelease?: boolean;
+	make_latest?: "true" | "false" | "legacy";
+	discussion_category_name?: string;
+};
+
+/**
+ * The PATCH body for update_release. GitHub resets a draft's not-yet-created
+ * tag to an `untagged-…` placeholder whenever a PATCH leaves `tag_name` out,
+ * whatever else it changes — so for a draft the current tag (and its target)
+ * is always sent back unless the caller sets a new one.
+ */
+export function releasePatch(
+	current: Pick<GitHubRelease, "draft" | "tag_name" | "target_commitish">,
+	edit: ReleaseEdit,
+): { patch: ReleaseEdit; warning?: string } {
+	const patch: ReleaseEdit = {
+		name: edit.name,
+		body: edit.body,
+		tag_name: edit.tag_name,
+		target_commitish: edit.target_commitish,
+		prerelease: edit.prerelease,
+		make_latest: edit.make_latest,
+		discussion_category_name: edit.discussion_category_name,
+	};
+	if (!current.draft || edit.tag_name !== undefined) {
+		return { patch };
+	}
+	if (isPlaceholderTag(current.tag_name)) {
+		return {
+			patch,
+			warning:
+				`This draft has no tag (${current.tag_name} is GitHub's placeholder), so ` +
+				`publish_release will refuse it. Set tag_name, plus target_commitish if the ` +
+				`tag does not exist yet.`,
+		};
+	}
+	patch.tag_name = current.tag_name;
+	patch.target_commitish = edit.target_commitish ?? current.target_commitish;
+	return { patch };
+}
+
 interface WorkflowReport {
 	/** Workflow files whose `on:` block names `release`. */
 	triggered_by_release: { path: string; name?: string }[];
+	/**
+	 * Workflow files that start because publishing creates the tag: `create`,
+	 * or `push` with a tag filter or no ref filter. Only set when the tag does
+	 * not exist yet.
+	 */
+	triggered_by_tag_creation?: { path: string; name?: string }[];
 	files_checked: number;
 	/** Set when there were more files than were read. */
 	unchecked_files?: string[];
@@ -890,7 +949,12 @@ interface WorkflowReport {
  * and it is best-effort: a failure to read is reported, not thrown, because it
  * must never stop a release from being previewed.
  */
-async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promise<WorkflowReport> {
+async function releaseWorkflows(
+	creds: TokenSource,
+	a: Repo,
+	ref: string,
+	createsTag: boolean,
+): Promise<WorkflowReport> {
 	let entries: GitHubContent[];
 	try {
 		entries = await gh<GitHubContent[]>(creds, `${repoPath(a)}/contents/.github/workflows`, {
@@ -935,9 +999,12 @@ async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promi
 	);
 
 	const unreadable = results.filter((r) => r.text === undefined).map((r) => r.path);
-	const triggered = results
-		.filter((r) => r.text !== undefined && triggersOnRelease(r.text))
-		.map((r) => ({ path: r.path, name: workflowName(r.text!) }));
+	const matching = (test: (yaml: string) => boolean) =>
+		results
+			.filter((r) => r.text !== undefined && test(r.text))
+			.map((r) => ({ path: r.path, name: workflowName(r.text!) }));
+	const triggered = matching(triggersOnRelease);
+	const byTag = createsTag ? matching(triggersOnTagCreation) : undefined;
 
 	const unchecked = files.slice(MAX_WORKFLOW_FILES).map((file) => file.path);
 	const notes: string[] = [];
@@ -950,6 +1017,7 @@ async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promi
 
 	return {
 		triggered_by_release: triggered,
+		triggered_by_tag_creation: byTag,
 		files_checked: checked.length - unreadable.length,
 		unchecked_files: unchecked.length ? unchecked : undefined,
 		note: notes.length ? notes.join(" ") : undefined,
@@ -957,31 +1025,42 @@ async function releaseWorkflows(creds: TokenSource, a: Repo, ref: string): Promi
 }
 
 /**
- * Whether a workflow's top-level `on:` names the `release` event. Its forms are
- * a scalar (`on: release`), a flow sequence (`on: [push, release]`), a flow
- * mapping (`on: { release: { types: [published] } }`), and a block of keys or
- * list items beneath `on:`.
+ * The events a workflow's top-level `on:` names, each with the text of its own
+ * settings (empty when it has none). The forms are a scalar (`on: release`), a
+ * flow sequence (`on: [push, release]`), a flow mapping
+ * (`on: { release: { types: [published] } }`) — either flow form may run over
+ * several lines — and a block of keys or list items beneath `on:`.
  *
  * Only the event names directly under `on:` count. Deeper lines, such as a
- * `- release` branch filter under `push:`, are someone else's settings, and
- * jobs are commonly named `release:` too.
+ * `- release` branch filter under `push:`, are that event's settings, and jobs
+ * are commonly named `release:` too.
  */
-export function triggersOnRelease(yaml: string): boolean {
-	const lines = yaml.split(/\r?\n/);
+export function workflowEvents(yaml: string): Map<string, string> {
+	const events = new Map<string, string>();
+	const lines = yaml.replace(/^\uFEFF/, "").split(/\r?\n/);
 	const start = lines.findIndex((line) => /^["']?on["']?\s*:/.test(line));
 	if (start === -1) {
-		return false;
+		return events;
 	}
 
-	const inline = stripComment(lines[start].replace(/^["']?on["']?\s*:/, "")).trim();
+	let inline = stripComment(lines[start].replace(/^["']?on["']?\s*:/, "")).trim();
 	if (inline) {
-		return inlineEvents(inline).includes("release");
+		// A flow collection may continue over the following lines until its
+		// brackets close.
+		for (let i = start + 1; unbalanced(inline) && i < lines.length; i++) {
+			inline += ` ${stripComment(lines[i]).trim()}`;
+		}
+		for (const [name, settings] of inlineEvents(inline)) {
+			events.set(name, settings);
+		}
+		return events;
 	}
 
 	// The block's events sit at the indent of its first entry. A block sequence
 	// may sit at column 0, directly under `on:`; anything else at column 0 is
 	// the next top-level key, which ends the block.
 	let indent: number | undefined;
+	let current: string | undefined;
 	for (const raw of lines.slice(start + 1)) {
 		const line = stripComment(raw).trimEnd();
 		if (!line.trim()) {
@@ -997,29 +1076,78 @@ export function triggersOnRelease(yaml: string): boolean {
 			break;
 		}
 		if (depth > indent) {
+			if (current !== undefined) {
+				events.set(current, `${events.get(current)}\n${entry}`.trim());
+			}
 			continue;
 		}
 
 		const item = entry.match(/^-\s*(.*)$/);
-		const name = item ? item[1] : entry.match(/^(["']?[\w-]+["']?)\s*:/)?.[1];
-		if (name !== undefined && unquote(name.trim()) === "release") {
-			return true;
+		const key = item ? undefined : entry.match(/^(["']?[\w-]+["']?)\s*:(.*)$/);
+		const name = item ? item[1] : key?.[1];
+		current = name === undefined ? undefined : unquote(name.trim());
+		if (current !== undefined) {
+			events.set(current, key?.[2].trim() ?? "");
 		}
 	}
-	return false;
+	return events;
 }
 
-/** The event names in an inline `on:` value: a scalar, `[a, b]` or `{ a: …, b: … }`. */
-function inlineEvents(value: string): string[] {
+/** Whether a workflow starts when a release is published. */
+export function triggersOnRelease(yaml: string): boolean {
+	return workflowEvents(yaml).has("release");
+}
+
+/**
+ * Whether a workflow starts when a new tag is pushed: on `create`, or on
+ * `push` unless its filters name only branches. GitHub runs a `push` workflow
+ * for a tag when it has a `tags`/`tags-ignore` filter, or when it has no ref
+ * filter at all; `paths` filters are not applied to tags.
+ */
+export function triggersOnTagCreation(yaml: string): boolean {
+	const events = workflowEvents(yaml);
+	if (events.has("create")) {
+		return true;
+	}
+	const push = events.get("push");
+	if (push === undefined) {
+		return false;
+	}
+	const filters = (names: string) =>
+		new RegExp(`(^|[\\s{,])["']?(${names})["']?\\s*:`).test(push);
+	return filters("tags|tags-ignore") || !filters("branches|branches-ignore");
+}
+
+/** Whether a flow collection still has brackets open. */
+function unbalanced(value: string): boolean {
+	if (!value.startsWith("[") && !value.startsWith("{")) {
+		return false;
+	}
+	let depth = 0;
+	for (const char of value) {
+		if (char === "[" || char === "{") depth++;
+		if (char === "]" || char === "}") depth--;
+	}
+	return depth > 0;
+}
+
+/**
+ * The events in an inline `on:` value — a scalar, `[a, b]` or
+ * `{ a: …, b: … }` — each with its settings text.
+ */
+function inlineEvents(value: string): [string, string][] {
 	if (value.startsWith("[")) {
-		return topLevelEntries(value.slice(1, value.lastIndexOf("]")));
+		return topLevelEntries(value.slice(1, value.lastIndexOf("]"))).map((name) => [name, ""]);
 	}
 	if (value.startsWith("{")) {
-		return topLevelEntries(value.slice(1, value.lastIndexOf("}"))).map((entry) =>
-			unquote(entry.split(":", 1)[0].trim()),
-		);
+		return topLevelEntries(value.slice(1, value.lastIndexOf("}"))).map((entry) => {
+			const colon = entry.indexOf(":");
+			return colon === -1
+				? [unquote(entry.trim()), ""]
+				: [unquote(entry.slice(0, colon).trim()), entry.slice(colon + 1).trim()];
+		});
 	}
-	return [unquote(value)];
+	return [[unquote(value), ""]];
 }
 
 /** Splits a flow collection's contents on the commas that are not nested inside it. */
