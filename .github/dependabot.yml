@@ -15,9 +15,9 @@ updates:
       # ox* tooling. Majors stay out of the groups, each arriving as its own
       # reviewable PR.
       #
-      # agents and @cloudflare/workers-oauth-provider are still 0.x, where a
-      # "minor" is semver's breaking bump, so they are excluded from the batch
-      # and arrive alone too. Fold them back in once they reach 1.0.
+      # agents is still 0.x, where a "minor" is semver's breaking bump, so it
+      # is excluded from the batch and arrives alone too. Fold it back in once
+      # it reaches 1.0. @cloudflare/workers-oauth-provider is 1.x and batched.
       groups:
           dev-minor-patch:
               dependency-type: development
@@ -27,7 +27,6 @@ updates:
               update-types: [minor, patch]
               exclude-patterns:
                   - agents
-                  - "@cloudflare/workers-oauth-provider"
 
     # The SHA-pinned actions in .github/workflows.
     - package-ecosystem: github-actions
