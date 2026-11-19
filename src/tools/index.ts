@@ -1,5 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { type CallToolResult, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { checkQuota, recordUsage } from "../db/usage";
 import { gh, ghGraphQL, seg } from "../github/client";
@@ -52,23 +51,28 @@ export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 		// `registerTool` is generic over its schema shape, which does not survive
 		// being funnelled through one helper — the zod schemas above each handler
 		// remain the real contract, and they are what actually validate input.
-		(server.registerTool as any)(name, config, async (args: any): Promise<CallToolResult> => {
-			// Counted whether or not it succeeds: a failed call still costs a GitHub
-			// round trip. Deferred so metering never sits in the latency path.
-			ctx.waitUntil(recordUsage(ctx.env, ctx.tenant.installationId, "tool_call"));
+		const { inputSchema, ...rest } = config;
+		(server.registerTool as any)(
+			name,
+			{ ...rest, inputSchema: z.object(inputSchema) },
+			async (args: any): Promise<CallToolResult> => {
+				// Counted whether or not it succeeds: a failed call still costs a GitHub
+				// round trip. Deferred so metering never sits in the latency path.
+				ctx.waitUntil(recordUsage(ctx.env, ctx.tenant.installationId, "tool_call"));
 
-			try {
-				const data = await handler(args);
-				return {
-					structuredContent: data as Record<string, unknown>,
-					content: [{ type: "text", text: scrub(JSON.stringify(data, null, 2)) }],
-				};
-			} catch (error) {
-				const identity = ranAs(config.inputSchema, args);
-				const text = scrub(explain(error, args, ctx.tenant, name, identity));
-				return { isError: true, content: [{ type: "text", text }] };
-			}
-		});
+				try {
+					const data = await handler(args);
+					return {
+						structuredContent: data as Record<string, unknown>,
+						content: [{ type: "text", text: scrub(JSON.stringify(data, null, 2)) }],
+					};
+				} catch (error) {
+					const identity = ranAs(config.inputSchema, args);
+					const text = scrub(explain(error, args, ctx.tenant, name, identity));
+					return { isError: true, content: [{ type: "text", text }] };
+				}
+			},
+		);
 	}
 
 	// ---------------------------------------------------------------- identity
