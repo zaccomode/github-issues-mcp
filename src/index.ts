@@ -1,5 +1,5 @@
 import { OAuthError, OAuthProvider } from "@cloudflare/workers-oauth-provider";
-import { createMcpHandler } from "agents/mcp";
+import { createMcpHandler } from "agents/mcp/server";
 import { authorizeHandler } from "./auth/handler";
 import { type GrantProps, grantRefFromRequest, isGrantProps } from "./auth/props";
 import { ReauthorizationRequired, refreshUserToken } from "./auth/user-oauth";
@@ -92,7 +92,7 @@ const mcpApiHandler = {
 			waitUntil: (promise) => ctx.waitUntil(promise),
 		});
 
-		return createMcpHandler(server, { route: MCP_ROUTE })(request, env, ctx);
+		return createMcpHandler(() => server, { route: MCP_ROUTE })(request, env, ctx);
 	},
 };
 

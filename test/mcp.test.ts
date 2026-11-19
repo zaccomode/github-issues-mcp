@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
-import { createMcpHandler } from "agents/mcp";
+import { createMcpHandler } from "agents/mcp/server";
 import { describe, expect, it } from "vitest";
 import type { AppEnv } from "../src/env";
 import type { TokenSource } from "../src/github/client";
@@ -8,8 +8,9 @@ import { createGitHubIssuesServer } from "../src/tools";
 
 /**
  * A smoke test of the MCP transport itself: `agents` serves /mcp through the
- * MCP SDK's transport, and the SDK version is forced by an npm override (see
- * package.json), so this proves the pair still speaks the protocol.
+ * v2 MCP server SDK's stateless handler, and @modelcontextprotocol/server is
+ * pinned to the version agents expects, so this proves the pair still speaks
+ * the protocol and that tool schemas reach clients intact.
  */
 describe("the MCP endpoint", () => {
 	const source: TokenSource = {
@@ -39,7 +40,7 @@ describe("the MCP endpoint", () => {
 			waitUntil: () => undefined,
 		});
 		const ctx = createExecutionContext();
-		const response = await createMcpHandler(server, { route: "/mcp" })(
+		const response = await createMcpHandler(() => server, { route: "/mcp" })(
 			new Request("https://example.com/mcp", {
 				method: "POST",
 				headers: {
@@ -83,7 +84,16 @@ describe("the MCP endpoint", () => {
 			session,
 		);
 		expect(list.status).toBe(200);
-		const names = (await json(list)).result.tools.map((tool: { name: string }) => tool.name);
+		const tools = (await json(list)).result.tools;
+		const names = tools.map((tool: { name: string }) => tool.name);
+		const getIssue = tools.find((tool: { name: string }) => tool.name === "get_issue");
+		expect(getIssue.inputSchema).toMatchObject({
+			type: "object",
+			properties: { owner: { type: "string" }, issue_number: { type: "integer" } },
+		});
+		expect(getIssue.inputSchema.required).toEqual(
+			expect.arrayContaining(["owner", "repo", "issue_number"]),
+		);
 		expect(names).toEqual(
 			expect.arrayContaining([
 				"publish_release",
@@ -91,5 +101,21 @@ describe("the MCP endpoint", () => {
 				"create_release_asset_upload",
 			]),
 		);
+	});
+
+	it("validates tool arguments before running the handler", async () => {
+		const response = await call({
+			jsonrpc: "2.0",
+			id: 3,
+			method: "tools/call",
+			params: { name: "get_issue", arguments: { owner: "acme", repo: "app" } },
+		});
+		expect(response.status).toBe(200);
+		const body = await json(response);
+		// Rejected by the schema, so the handler (whose token() throws) never ran.
+		const error = body.error?.message ?? body.result?.content?.[0]?.text ?? "";
+		expect(body.error ?? body.result?.isError).toBeTruthy();
+		expect(error).toMatch(/issue_number/);
+		expect(error).not.toMatch(/No GitHub calls/);
 	});
 });
