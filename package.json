@@ -1,6 +1,6 @@
 {
   "name": "github-issues-mcp",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "private": true,
   "scripts": {
     "deploy": "npm run db:migrate && wrangler deploy",
@@ -19,6 +19,7 @@
     "@cloudflare/workers-oauth-provider": "^0.8.2",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "agents": "^0.17.1",
+    "yaml": "^2.9.1",
     "zod": "^4.6.7"
   },
   "devDependencies": {

@@ -25,7 +25,7 @@ Security (read-only): `list_dependabot_alerts`, `get_dependabot_alert`,
 
 Releases: `list_releases`, `get_release`, `list_release_assets`, `list_tags`,
 `compare_refs`, `generate_release_notes`, `create_release`, `update_release`,
-`publish_release`, `unpublish_release`, `delete_release`,
+`publish_release`, `promote_release`, `unpublish_release`, `delete_release`,
 `create_release_asset_upload`, `upload_release_asset`, `update_release_asset`,
 `delete_release_asset`.
 
@@ -87,16 +87,23 @@ delete releases, and manage the files attached to them.
   `compare_refs` lists the commits between two refs for writing notes by hand.
 - **Publishing takes two calls.** `publish_release` without `confirm` publishes
   nothing: it checks the release is ready, resolves the commit it would tag,
-  lists the workflows in `.github/workflows/` that run `on: release`, and returns
+  lists the workflows in `.github/workflows/` whose `on: release` (and its
+  `types:` filter, if any) matches what publishing sends, and returns
   a `confirm_token`. If the tag doesn't exist yet, publishing creates it, so the
   preview also lists the `create` workflows and `push` workflows that run on
   tags, under `triggered_by_tag_creation`. A draft whose tag is GitHub's
   `untagged-…` placeholder is refused. Calling it again with `confirm: true` and that token
   publishes, with the tag pinned to the previewed commit. If the release, its
   target or the branch head changed in between, the token no longer matches and
-  nothing is published. This matters because a release published with an
+  nothing is published. The token also covers whether the tag existed and which
+  workflows were listed. This matters because a release published with an
   App's token starts workflows, unlike one published with Actions' own
   `GITHUB_TOKEN`, so publishing can deploy or push a package.
+- **Promoting a prerelease takes two calls too.** Turning a published
+  prerelease into a full release sends `release: released`, which starts
+  deploys like this repository's own. `update_release` refuses that change;
+  `promote_release` previews the workflows it starts and then confirms with a
+  token, the same way `publish_release` does.
 - **Unpublishing only hides.** `unpublish_release` turns a release back into a
   draft, but notifications already sent and workflows already started stay done.
   Repositories with immutable releases turned on lock a release once it is
