@@ -44,7 +44,7 @@ const CLOSING_ISSUES_QUERY = `
 export function createGitHubIssuesServer(ctx: ToolContext): McpServer {
 	const server = new McpServer({
 		name: "github-issues",
-		version: "2.5.0",
+		version: "2.6.0",
 	});
 
 	/** Wraps a handler so GitHub failures surface as tool errors, not exceptions. */
