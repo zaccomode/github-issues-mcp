@@ -21,6 +21,7 @@
 import { z } from "zod";
 import { GitHubError, type Repo, type TokenSource, gh } from "../github/client";
 import { type GitHubRelease, type GitHubReleaseAsset, getRelease } from "../github/releases";
+import { type ReleaseAction, type WorkflowReport, releaseWorkflows } from "../github/workflows";
 import { compactRelease, compactReleaseAsset } from "../shape";
 import { type Register, type ToolContext, actAs, paging, repoPath, repoShape } from "./common";
 
@@ -31,9 +32,6 @@ const UNTRUSTED_NOTE =
 
 /** Which release fields carry contributor-written text. */
 const RELEASE_UNTRUSTED = ["name", "body"];
-
-/** How many workflow files `publish_release` reads before giving up. */
-const MAX_WORKFLOW_FILES = 20;
 
 /** How many releases the draft-by-tag fallback searches. */
 const DRAFT_SEARCH_LIMIT = 100;
@@ -391,7 +389,8 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				"notes; to add a section, use `body_append`. Only drafts unless " +
 				"`allow_published: true`. A new tag that does not exist yet needs " +
 				"`target_commitish`; on a published release GitHub creates that tag at once. " +
-				"This cannot publish or unpublish — use publish_release and unpublish_release.",
+				"This cannot publish or unpublish, or turn a published prerelease into a full " +
+				"release — use publish_release, unpublish_release and promote_release.",
 			inputSchema: {
 				...repoShape,
 				release_id: releaseId,
@@ -431,6 +430,14 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 			const creds = ctx.creds.as(a.act_as);
 			const current = await getRelease(creds, a, a.release_id);
 
+			if (!current.draft && current.prerelease && a.prerelease === false) {
+				throw new Error(
+					`Release ${a.release_id} (${current.tag_name}) is a published prerelease. ` +
+						`Making it a full release sends \`release: released\` and starts every ` +
+						`workflow that runs on it — often a production deploy — so it is not done ` +
+						`here. Use promote_release, which previews those workflows first.`,
+				);
+			}
 			if (!current.draft && !a.allow_published) {
 				throw new Error(
 					`Release ${a.release_id} (${current.tag_name}) is published. Changing it ` +
@@ -563,12 +570,21 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 
 			// The workflows that run are the ones at the commit the tag points to,
 			// so read them there rather than on the default branch.
-			const workflows = await releaseWorkflows(creds, a, sha, !tagExists);
+			const workflows = await releaseWorkflows(creds, a, sha, {
+				actions: publishActions(release.prerelease),
+				createsTag: !tagExists,
+			});
 			const tag = tagExists
 				? `Uses the existing tag ${release.tag_name} (commit ${sha}).`
 				: `Creates tag ${release.tag_name} at ${sha}` +
 					(ref === sha ? "." : ` (the current head of ${ref}).`);
-			const token = await publishToken(release, sha, a.make_latest, a.act_as);
+			const token = await confirmToken("publish", release, {
+				sha,
+				tagExists,
+				makeLatest: a.make_latest,
+				actor: a.act_as,
+				workflows,
+			});
 
 			if (!a.confirm) {
 				return {
@@ -585,21 +601,7 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				};
 			}
 
-			if (a.confirm_token === undefined) {
-				throw new Error(
-					"confirm: true needs the confirm_token from a preview. Call publish_release " +
-						"without confirm first, show the person what it reports, then confirm " +
-						"with its token.",
-				);
-			}
-			if (a.confirm_token !== token) {
-				throw new Error(
-					`Release ${a.release_id} (${release.tag_name}) changed since the preview: ` +
-						`its notes, flags or tag, the commit it would tag, make_latest or act_as ` +
-						`differ. Nothing was published. Preview again and confirm with the new ` +
-						`token.`,
-				);
-			}
+			checkConfirmToken("publish_release", release, a.confirm_token, token);
 
 			const published = await gh<GitHubRelease>(
 				creds,
@@ -622,6 +624,105 @@ export function registerReleaseTools(register: Register, ctx: ToolContext) {
 				workflows,
 				immutable: published.immutable === true ? true : undefined,
 				release: compactRelease(published),
+			};
+		},
+	);
+
+	register(
+		"promote_release",
+		{
+			annotations: { destructiveHint: true },
+			description:
+				"Turn a published prerelease into a full release. GitHub then sends " +
+				"`release: released`, which starts any workflow that runs on it — production " +
+				"deploys often do. Works in two steps, like publish_release: call it first " +
+				"WITHOUT `confirm` to see the workflows it will start and get a " +
+				"`confirm_token`, show that to the person, then call again with `confirm: true` " +
+				"and the token. update_release refuses this change.",
+			inputSchema: {
+				...repoShape,
+				release_id: releaseId,
+				confirm: z
+					.boolean()
+					.default(false)
+					.describe("Leave unset to preview. true promotes."),
+				confirm_token: z
+					.string()
+					.optional()
+					.describe("The `confirm_token` from the preview. Required with confirm: true."),
+				make_latest: makeLatest,
+				...actAs,
+			},
+		},
+		async (a) => {
+			const creds = ctx.creds.as(a.act_as);
+			const release = await getRelease(creds, a, a.release_id);
+
+			if (release.draft) {
+				throw new Error(
+					`Release ${a.release_id} (${release.tag_name}) is a draft. Publish it with ` +
+						`publish_release; set prerelease: false with update_release first if it ` +
+						`should be a full release.`,
+				);
+			}
+			if (!release.prerelease) {
+				throw new Error(
+					`Release ${a.release_id} (${release.tag_name}) is already a full release.`,
+				);
+			}
+			if (release.immutable) {
+				throw new Error(
+					`Release ${a.release_id} (${release.tag_name}) is immutable: the repository ` +
+						`locks releases once they are published, so it cannot be changed.`,
+				);
+			}
+
+			// A published release's tag exists; its workflows are read at that commit.
+			const sha = await resolveCommit(creds, a, release.tag_name);
+			if (!sha) {
+				throw new Error(
+					`Tag ${release.tag_name} could not be resolved to a commit, so the workflows ` +
+						`promoting would start cannot be checked.`,
+				);
+			}
+
+			const workflows = await releaseWorkflows(creds, a, sha, {
+				actions: PROMOTE_ACTIONS,
+				createsTag: false,
+			});
+			const token = await confirmToken("promote", release, {
+				sha,
+				tagExists: true,
+				makeLatest: a.make_latest,
+				actor: a.act_as,
+				workflows,
+			});
+
+			if (!a.confirm) {
+				return {
+					promoted: false,
+					target_sha: sha,
+					workflows,
+					release: compactRelease(release),
+					confirm_token: token,
+					next_step:
+						"Nothing has changed. Show the person the workflows above, then call " +
+						"promote_release again with confirm: true and this confirm_token.",
+				};
+			}
+
+			checkConfirmToken("promote_release", release, a.confirm_token, token);
+
+			const promoted = await gh<GitHubRelease>(
+				creds,
+				`${repoPath(a)}/releases/${a.release_id}`,
+				{ method: "PATCH", body: { prerelease: false, make_latest: a.make_latest } },
+			);
+
+			return {
+				promoted: true,
+				workflows,
+				release: compactRelease(promoted),
 			};
 		},
 	);
@@ -734,14 +835,6 @@ interface GitHubComparison {
 	html_url: string;
 }
 
-/** An entry in a Contents API directory listing, or a file read through it. */
-interface GitHubContent {
-	type: string;
-	name: string;
-	path: string;
-	content?: string;
-}
-
 /**
  * GitHub's by-tag endpoint returns published releases only, and a draft is
  * exactly what an agent most often asks for by tag ("the draft for v1.4.0"),
@@ -814,22 +907,29 @@ async function resolveCommit(
 }
 
 /**
- * Binds a publish_release confirmation to what its preview showed: the
- * release as it stood, the commit it would tag, and the options given. Any
- * change in between gives a different token, so a stale preview cannot be
- * confirmed. It is a fingerprint, not a secret; the caller is already
- * authorised to publish.
+ * Binds a publish_release or promote_release confirmation to what its preview
+ * showed: the release as it stood, the commit it would tag, whether that tag
+ * already existed, the workflows listed and the options given. Any change in
+ * between gives a different token, so a stale preview cannot be confirmed. It
+ * is a fingerprint, not a secret; the caller is already authorised to publish.
  */
-export async function publishToken(
+export async function confirmToken(
+	action: "publish" | "promote",
 	release: Pick<
 		GitHubRelease,
 		"id" | "tag_name" | "target_commitish" | "name" | "body" | "prerelease" | "updated_at"
 	>,
-	sha: string,
-	makeLatest: string | undefined,
-	actor: string,
+	state: {
+		sha: string;
+		tagExists: boolean;
+		makeLatest?: string;
+		actor: string;
+		workflows?: Pick<WorkflowReport, "triggered_by_release" | "triggered_by_tag_creation">;
+	},
 ): Promise<string> {
+	const paths = (list?: { path: string }[]) => list?.map((w) => w.path).sort() ?? null;
 	const fingerprint = JSON.stringify([
+		action,
 		release.id,
 		release.updated_at ?? null,
 		release.tag_name,
@@ -837,15 +937,53 @@ export async function publishToken(
 		release.name,
 		release.body,
 		release.prerelease,
-		sha,
-		makeLatest ?? null,
-		actor,
+		state.sha,
+		state.tagExists,
+		state.makeLatest ?? null,
+		state.actor,
+		paths(state.workflows?.triggered_by_release),
+		paths(state.workflows?.triggered_by_tag_creation),
 	]);
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(fingerprint));
 	return [...new Uint8Array(digest).slice(0, 8)]
 		.map((byte) => byte.toString(16).padStart(2, "0"))
 		.join("");
 }
+
+/** The confirm half of a two-step tool: refuses a missing or stale token. */
+function checkConfirmToken(
+	tool: string,
+	release: Pick<GitHubRelease, "id" | "tag_name">,
+	given: string | undefined,
+	expected: string,
+): void {
+	if (given === undefined) {
+		throw new Error(
+			`confirm: true needs the confirm_token from a preview. Call ${tool} without ` +
+				`confirm first, show the person what it reports, then confirm with its token.`,
+		);
+	}
+	if (given !== expected) {
+		throw new Error(
+			`Release ${release.id} (${release.tag_name}) changed since the preview: its notes, ` +
+				`flags or tag, the commit it would tag, whether that tag exists, the workflows ` +
+				`it would start, make_latest or act_as differ. Nothing was changed. Preview ` +
+				`again and confirm with the new token.`,
+		);
+	}
+}
+
+/**
+ * The `release` activity types publishing a draft sends: `published`, then
+ * `released` or `prereleased`. `created` is included too, erring on the side
+ * of listing a workflow that might run.
+ */
+export function publishActions(prerelease: boolean): ReleaseAction[] {
+	return ["published", "created", prerelease ? "prereleased" : "released"];
+}
+
+/** Promoting a published prerelease to a full release sends these. */
+export const PROMOTE_ACTIONS: ReleaseAction[] = ["edited", "released"];
 
 /**
  * A 422 from create or update usually means another release already uses the
@@ -877,9 +1015,13 @@ async function explainDuplicate(
 	);
 }
 
-/** GitHub's stand-in tag name for a draft whose tag was never set or was lost. */
+/**
+ * GitHub's stand-in tag name for a draft whose tag was never set or was lost:
+ * `untagged-` and a hex id, e.g. `untagged-24962f94d18b366c8863`. A real tag
+ * that merely starts with `untagged-` does not match.
+ */
 export function isPlaceholderTag(tag: string): boolean {
-	return tag.startsWith("untagged-");
+	return /^untagged-[0-9a-f]{20,}$/.test(tag);
 }
 
 type ReleaseEdit = {
@@ -926,267 +1068,6 @@ export function releasePatch(
 	patch.tag_name = current.tag_name;
 	patch.target_commitish = edit.target_commitish ?? current.target_commitish;
 	return { patch };
-}
-
-interface WorkflowReport {
-	/** Workflow files whose `on:` block names `release`. */
-	triggered_by_release: { path: string; name?: string }[];
-	/**
-	 * Workflow files that start because publishing creates the tag: `create`,
-	 * or `push` with a tag filter or no ref filter. Only set when the tag does
-	 * not exist yet.
-	 */
-	triggered_by_tag_creation?: { path: string; name?: string }[];
-	files_checked: number;
-	/** Set when there were more files than were read. */
-	unchecked_files?: string[];
-	note?: string;
-}
-
-/**
- * Lists the workflows that a published release will start. This reads only the
- * `on:` block, without a full YAML parser — an unusual layout could be missed —
- * and it is best-effort: a failure to read is reported, not thrown, because it
- * must never stop a release from being previewed.
- */
-async function releaseWorkflows(
-	creds: TokenSource,
-	a: Repo,
-	ref: string,
-	createsTag: boolean,
-): Promise<WorkflowReport> {
-	let entries: GitHubContent[];
-	try {
-		entries = await gh<GitHubContent[]>(creds, `${repoPath(a)}/contents/.github/workflows`, {
-			query: { ref },
-		});
-	} catch (error) {
-		if (error instanceof GitHubError && error.status === 404) {
-			return {
-				triggered_by_release: [],
-				files_checked: 0,
-				note: "No workflows at this ref.",
-			};
-		}
-		return {
-			triggered_by_release: [],
-			files_checked: 0,
-			note: `Could not read .github/workflows, so workflows that publishing starts are unknown: ${
-				error instanceof Error ? error.message : String(error)
-			}`,
-		};
-	}
-
-	const files = (Array.isArray(entries) ? entries : []).filter(
-		(entry) => entry.type === "file" && /\.ya?ml$/i.test(entry.name),
-	);
-	const checked = files.slice(0, MAX_WORKFLOW_FILES);
-
-	const results = await Promise.all(
-		checked.map(async (file) => {
-			try {
-				const content = await gh<GitHubContent>(
-					creds,
-					`${repoPath(a)}/contents/${file.path.split("/").map(encodeURIComponent).join("/")}`,
-					{ query: { ref } },
-				);
-				const text = decodeBase64(content.content ?? "");
-				return { path: file.path, text };
-			} catch {
-				return { path: file.path, text: undefined };
-			}
-		}),
-	);
-
-	const unreadable = results.filter((r) => r.text === undefined).map((r) => r.path);
-	const matching = (test: (yaml: string) => boolean) =>
-		results
-			.filter((r) => r.text !== undefined && test(r.text))
-			.map((r) => ({ path: r.path, name: workflowName(r.text!) }));
-	const triggered = matching(triggersOnRelease);
-	const byTag = createsTag ? matching(triggersOnTagCreation) : undefined;
-
-	const unchecked = files.slice(MAX_WORKFLOW_FILES).map((file) => file.path);
-	const notes: string[] = [];
-	if (unreadable.length) {
-		notes.push(`Could not read: ${unreadable.join(", ")}.`);
-	}
-	if (unchecked.length) {
-		notes.push(`Only the first ${MAX_WORKFLOW_FILES} workflow files were checked.`);
-	}
-
-	return {
-		triggered_by_release: triggered,
-		triggered_by_tag_creation: byTag,
-		files_checked: checked.length - unreadable.length,
-		unchecked_files: unchecked.length ? unchecked : undefined,
-		note: notes.length ? notes.join(" ") : undefined,
-	};
-}
-
-/**
- * The events a workflow's top-level `on:` names, each with the text of its own
- * settings (empty when it has none). The forms are a scalar (`on: release`), a
- * flow sequence (`on: [push, release]`), a flow mapping
- * (`on: { release: { types: [published] } }`) — either flow form may run over
- * several lines — and a block of keys or list items beneath `on:`.
- *
- * Only the event names directly under `on:` count. Deeper lines, such as a
- * `- release` branch filter under `push:`, are that event's settings, and jobs
- * are commonly named `release:` too.
- */
-export function workflowEvents(yaml: string): Map<string, string> {
-	const events = new Map<string, string>();
-	const lines = yaml.replace(/^\uFEFF/, "").split(/\r?\n/);
-	const start = lines.findIndex((line) => /^["']?on["']?\s*:/.test(line));
-	if (start === -1) {
-		return events;
-	}
-
-	let inline = stripComment(lines[start].replace(/^["']?on["']?\s*:/, "")).trim();
-	if (inline) {
-		// A flow collection may continue over the following lines until its
-		// brackets close.
-		for (let i = start + 1; unbalanced(inline) && i < lines.length; i++) {
-			inline += ` ${stripComment(lines[i]).trim()}`;
-		}
-		for (const [name, settings] of inlineEvents(inline)) {
-			events.set(name, settings);
-		}
-		return events;
-	}
-
-	// The block's events sit at the indent of its first entry. A block sequence
-	// may sit at column 0, directly under `on:`; anything else at column 0 is
-	// the next top-level key, which ends the block.
-	let indent: number | undefined;
-	let current: string | undefined;
-	for (const raw of lines.slice(start + 1)) {
-		const line = stripComment(raw).trimEnd();
-		if (!line.trim()) {
-			continue;
-		}
-		const depth = line.length - line.trimStart().length;
-		const entry = line.trimStart();
-		if (depth === 0 && !entry.startsWith("-")) {
-			break;
-		}
-		indent ??= depth;
-		if (depth < indent) {
-			break;
-		}
-		if (depth > indent) {
-			if (current !== undefined) {
-				events.set(current, `${events.get(current)}\n${entry}`.trim());
-			}
-			continue;
-		}
-
-		const item = entry.match(/^-\s*(.*)$/);
-		const key = item ? undefined : entry.match(/^(["']?[\w-]+["']?)\s*:(.*)$/);
-		const name = item ? item[1] : key?.[1];
-		current = name === undefined ? undefined : unquote(name.trim());
-		if (current !== undefined) {
-			events.set(current, key?.[2].trim() ?? "");
-		}
-	}
-	return events;
-}
-
-/** Whether a workflow starts when a release is published. */
-export function triggersOnRelease(yaml: string): boolean {
-	return workflowEvents(yaml).has("release");
-}
-
-/**
- * Whether a workflow starts when a new tag is pushed: on `create`, or on
- * `push` unless its filters name only branches. GitHub runs a `push` workflow
- * for a tag when it has a `tags`/`tags-ignore` filter, or when it has no ref
- * filter at all; `paths` filters are not applied to tags.
- */
-export function triggersOnTagCreation(yaml: string): boolean {
-	const events = workflowEvents(yaml);
-	if (events.has("create")) {
-		return true;
-	}
-	const push = events.get("push");
-	if (push === undefined) {
-		return false;
-	}
-	const filters = (names: string) =>
-		new RegExp(`(^|[\\s{,])["']?(${names})["']?\\s*:`).test(push);
-	return filters("tags|tags-ignore") || !filters("branches|branches-ignore");
-}
-
-/** Whether a flow collection still has brackets open. */
-function unbalanced(value: string): boolean {
-	if (!value.startsWith("[") && !value.startsWith("{")) {
-		return false;
-	}
-	let depth = 0;
-	for (const char of value) {
-		if (char === "[" || char === "{") depth++;
-		if (char === "]" || char === "}") depth--;
-	}
-	return depth > 0;
-}
-
-/**
- * The events in an inline `on:` value — a scalar, `[a, b]` or
- * `{ a: …, b: … }` — each with its settings text.
- */
-function inlineEvents(value: string): [string, string][] {
-	if (value.startsWith("[")) {
-		return topLevelEntries(value.slice(1, value.lastIndexOf("]"))).map((name) => [name, ""]);
-	}
-	if (value.startsWith("{")) {
-		return topLevelEntries(value.slice(1, value.lastIndexOf("}"))).map((entry) => {
-			const colon = entry.indexOf(":");
-			return colon === -1
-				? [unquote(entry.trim()), ""]
-				: [unquote(entry.slice(0, colon).trim()), entry.slice(colon + 1).trim()];
-		});
-	}
-	return [[unquote(value), ""]];
-}
-
-/** Splits a flow collection's contents on the commas that are not nested inside it. */
-function topLevelEntries(body: string): string[] {
-	const entries: string[] = [];
-	let depth = 0;
-	let current = "";
-	for (const char of body) {
-		if (char === "[" || char === "{") depth++;
-		if (char === "]" || char === "}") depth--;
-		if (char === "," && depth === 0) {
-			entries.push(current);
-			current = "";
-		} else {
-			current += char;
-		}
-	}
-	entries.push(current);
-	return entries.map((entry) => unquote(entry.trim())).filter(Boolean);
-}
-
-function unquote(value: string): string {
-	return value.replace(/^(["'])(.*)\1$/, "$2");
-}
-
-/** Drops a trailing YAML comment: a `#` at the start or after whitespace. */
-function stripComment(line: string): string {
-	return line.replace(/(^|\s)#.*$/, "");
-}
-
-function workflowName(yaml: string): string | undefined {
-	const match = yaml.match(/^name\s*:\s*(.+?)\s*$/m);
-	return match ? match[1].replace(/^["']|["']$/g, "") : undefined;
-}
-
-/** The Contents API returns file bodies as base64 wrapped at 60 columns. */
-function decodeBase64(encoded: string): string {
-	const binary = atob(encoded.replace(/\s/g, ""));
-	return new TextDecoder().decode(Uint8Array.from(binary, (char) => char.charCodeAt(0)));
 }
 
 function firstLine(message: string | undefined): string | undefined {
