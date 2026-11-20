@@ -128,6 +128,25 @@ describe("confirmToken", () => {
 					workflows: { ...state.workflows, triggered_by_release: [] },
 				}),
 		],
+		[
+			"the workflow_run chain",
+			() =>
+				confirmToken("publish", release, {
+					...state,
+					workflows: {
+						...state.workflows,
+						triggered_by_workflow_run: [{ path: ".github/workflows/after.yml" }],
+					},
+				}),
+		],
+		[
+			"the unanalysed files",
+			() =>
+				confirmToken("publish", release, {
+					...state,
+					workflows: { ...state.workflows, unanalysed: [".github/workflows/odd.yml"] },
+				}),
+		],
 		["the action", () => confirmToken("promote", release, state)],
 	])("changes with %s", async (_, other) => {
 		expect(await other()).not.toBe(await base());
@@ -135,10 +154,10 @@ describe("confirmToken", () => {
 });
 
 describe("publishActions", () => {
-	it("sends released for a full release and prereleased for a prerelease", () => {
+	it("sends released for a full release and neither for a prerelease", () => {
 		expect(publishActions(false)).toContain("released");
 		expect(publishActions(false)).not.toContain("prereleased");
-		expect(publishActions(true)).toContain("prereleased");
-		expect(publishActions(true)).not.toContain("released");
+		// GitHub sends only `published` for a prerelease published from a draft.
+		expect(publishActions(true)).toEqual(["published", "created"]);
 	});
 });

@@ -99,6 +99,15 @@ delete releases, and manage the files attached to them.
   workflows were listed. This matters because a release published with an
   App's token starts workflows, unlike one published with Actions' own
   `GITHUB_TOKEN`, so publishing can deploy or push a package.
+- **Workflow previews fail safe.** A workflow file that can't be read or parsed
+  (invalid YAML, or one past the parser's alias limit) is listed under
+  `unanalysed` as possibly starting, never dropped, and is bound into the
+  token. Workflows with `on: workflow_run` that name a listed workflow, directly
+  or through a chain of up to three, are listed under
+  `triggered_by_workflow_run`. GitHub reads `workflow_run` workflows from the
+  default branch rather than the tagged commit, so that list is an
+  approximation and the preview says so. Workflow names, paths and the release
+  title come from contributors, so both tools mark them in `untrusted_fields`.
 - **Promoting a prerelease takes two calls too.** Turning a published
   prerelease into a full release sends `release: released`, which starts
   deploys like this repository's own. `update_release` refuses that change;

@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { parseWorkflow, triggersOnRelease, triggersOnTagCreation } from "../src/github/workflows";
+import {
+	parseWorkflow,
+	triggersOnRelease,
+	triggersOnTagCreation,
+	workflowRunChain,
+	workflowRunSources,
+} from "../src/github/workflows";
+import { aliasBomb } from "./fixtures";
 
 describe("triggersOnRelease", () => {
 	const runs = (yaml: string) => triggersOnRelease(yaml.replace(/^\n/, ""));
@@ -96,6 +103,12 @@ describe("quote-aware parsing", () => {
 		expect(triggersOnRelease("on: [release\n")).toBe(false);
 	});
 
+	it("treats an alias bomb as unanalysable instead of throwing", () => {
+		const yaml = aliasBomb();
+		expect(() => parseWorkflow(yaml)).not.toThrow();
+		expect(parseWorkflow(yaml)).toBeUndefined();
+	});
+
 	it("reads the workflow name", () => {
 		expect(parseWorkflow("name: 'Deploy'\non: release\n")?.name).toBe("Deploy");
 	});
@@ -134,5 +147,43 @@ describe("release activity types", () => {
 				"released",
 			]),
 		).toBe(false);
+	});
+});
+
+describe("workflow_run", () => {
+	const parse = (yaml: string) => {
+		const workflow = parseWorkflow(yaml);
+		if (!workflow) {
+			throw new Error("unparseable");
+		}
+		return workflow;
+	};
+
+	it("reads the workflows a workflow_run trigger waits for", () => {
+		expect(
+			workflowRunSources(parse("on:\n  workflow_run:\n    workflows: [Release]\n")),
+		).toEqual(["Release"]);
+		expect(workflowRunSources(parse("on:\n  workflow_run:\n    workflows: Release\n"))).toEqual(
+			["Release"],
+		);
+		expect(workflowRunSources(parse("on: push\n"))).toBeUndefined();
+	});
+
+	it("follows chains up to three levels and ignores unrelated workflows", () => {
+		const wf = (path: string, yaml: string) => ({ path, workflow: parse(yaml) });
+		const release = wf("release.yml", "name: Release\non: release\n");
+		const all = [
+			release,
+			wf("deploy.yml", "name: Deploy\non:\n  workflow_run:\n    workflows: [Release]\n"),
+			wf("notify.yml", "name: Notify\non:\n  workflow_run:\n    workflows: [Deploy]\n"),
+			wf("audit.yml", "name: Audit\non:\n  workflow_run:\n    workflows: [Notify]\n"),
+			wf("deeper.yml", "name: Deeper\non:\n  workflow_run:\n    workflows: [Audit]\n"),
+			wf("ci.yml", "name: CI\non:\n  workflow_run:\n    workflows: [Lint]\n"),
+		];
+		expect(workflowRunChain(all, [release]).map((w) => w.path)).toEqual([
+			"deploy.yml",
+			"notify.yml",
+			"audit.yml",
+		]);
 	});
 });

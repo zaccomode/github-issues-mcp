@@ -4,6 +4,7 @@ import type { AppEnv } from "../src/env";
 import type { TokenSource } from "../src/github/client";
 import type { Register, ToolContext } from "../src/tools/common";
 import { registerReleaseTools } from "../src/tools/releases";
+import { aliasBomb } from "./fixtures";
 
 /**
  * The release tools' handlers against a fake GitHub API: every request goes
@@ -183,6 +184,53 @@ describe("publish_release", () => {
 		expect(preview.workflows.triggered_by_release).toEqual([]);
 	});
 
+	it("marks the release and workflow text as untrusted", async () => {
+		const preview = await publish({ release_id: 1 });
+		expect(preview.untrusted_fields).toEqual(
+			expect.arrayContaining([
+				"release.name",
+				"workflows.triggered_by_release[].name",
+				"workflows.triggered_by_tag_creation[].name",
+			]),
+		);
+		const done = await publish({
+			release_id: 1,
+			confirm: true,
+			confirm_token: preview.confirm_token,
+		});
+		expect(done.untrusted_fields).toEqual(preview.untrusted_fields);
+	});
+
+	it("lists an unparseable workflow as unanalysed instead of failing", async () => {
+		state.workflows["bomb.yml"] = aliasBomb();
+		state.workflows["broken.yml"] = "on: [release\n";
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.unanalysed).toEqual([
+			".github/workflows/bomb.yml",
+			".github/workflows/broken.yml",
+		]);
+		expect(preview.workflows.note).toMatch(/may still run/);
+		expect(preview.workflows.triggered_by_release.map((w: any) => w.path)).toEqual([
+			".github/workflows/deploy.yml",
+		]);
+
+		// A file that becomes unanalysable after the preview changes the token.
+		delete state.workflows["broken.yml"];
+		await expect(
+			publish({ release_id: 1, confirm: true, confirm_token: preview.confirm_token }),
+		).rejects.toThrow(/changed since the preview/);
+	});
+
+	it("lists workflow_run workflows chained after the release ones", async () => {
+		state.workflows["after.yml"] =
+			"name: After deploy\non:\n  workflow_run:\n    workflows: [Deploy]\n";
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.triggered_by_workflow_run).toEqual([
+			{ path: ".github/workflows/after.yml", name: "After deploy" },
+		]);
+		expect(preview.workflows.note).toMatch(/default branch/);
+	});
+
 	it("refuses confirm without a token", async () => {
 		await expect(publish({ release_id: 1, confirm: true })).rejects.toThrow(
 			/needs the confirm_token/,
@@ -250,6 +298,19 @@ describe("promote_release", () => {
 		});
 		expect(done.promoted).toBe(true);
 		expect(state.patches).toEqual([{ prerelease: false }]);
+	});
+
+	it("marks the release and workflow text as untrusted", async () => {
+		const preview = await promote({ release_id: 1 });
+		expect(preview.untrusted_fields).toEqual(
+			expect.arrayContaining(["release.name", "workflows.triggered_by_release[].name"]),
+		);
+		const done = await promote({
+			release_id: 1,
+			confirm: true,
+			confirm_token: preview.confirm_token,
+		});
+		expect(done.untrusted_fields).toEqual(preview.untrusted_fields);
 	});
 
 	it("refuses a token from a publish preview", async () => {

@@ -5,6 +5,9 @@
  * person approving can see the deploys and package publishes that follow.
  * Workflow files are parsed with a real YAML parser; only the top-level `on:`
  * and `name:` are read.
+ *
+ * Every gap fails safe: a file that cannot be read or parsed is listed as
+ * unanalysed (it may still run), never silently dropped.
  */
 
 import { parseDocument } from "yaml";
@@ -40,6 +43,18 @@ export interface WorkflowReport {
 	 * not exist yet.
 	 */
 	triggered_by_tag_creation?: WorkflowRef[];
+	/**
+	 * Workflow files at the ref with `on: workflow_run` naming one of the
+	 * workflows above, directly or through a chain of them. GitHub reads these
+	 * from the default branch, not the ref, so this is an approximation.
+	 */
+	triggered_by_workflow_run?: WorkflowRef[];
+	/**
+	 * Workflow files that could not be read or parsed. Whether they run is
+	 * unknown — GitHub's parser may accept what this one rejects — so they are
+	 * reported, and bound into the confirm token, as possibly starting.
+	 */
+	unanalysed?: string[];
 	/** The `release` activity types this change sends. */
 	release_actions: ReleaseAction[];
 	files_checked: number;
@@ -63,17 +78,25 @@ interface ParsedWorkflow {
 /**
  * Parses a workflow file's `name:` and the events its top-level `on:` names,
  * each with its settings (null when it has none). Returns undefined for a file
- * that is not valid YAML — GitHub will not run that workflow either.
+ * this parser cannot read: invalid YAML, or one that trips the parser's limits
+ * (such as its cap on alias expansion). GitHub's own parser may still accept
+ * it, so callers must treat undefined as "unknown", not "will not run".
  *
  * `on:` may be a scalar (`on: release`), a sequence (`on: [push, release]`) or
  * a mapping of events to their settings, in block or flow style.
  */
 export function parseWorkflow(yaml: string): ParsedWorkflow | undefined {
-	const doc = parseDocument(yaml.replace(/^﻿/, ""));
-	if (doc.errors.length) {
+	let root: unknown;
+	try {
+		const doc = parseDocument(yaml.replace(/^\uFEFF/, ""));
+		if (doc.errors.length) {
+			return undefined;
+		}
+		// toJS throws, rather than reporting an error, past maxAliasCount.
+		root = doc.toJS();
+	} catch {
 		return undefined;
 	}
-	const root: unknown = doc.toJS();
 	if (!isRecord(root)) {
 		return { events: new Map() };
 	}
@@ -96,6 +119,54 @@ export function parseWorkflow(yaml: string): ParsedWorkflow | undefined {
 
 	const name = typeof root.name === "string" ? root.name : undefined;
 	return { name, events };
+}
+
+/**
+ * The workflow names an `on: workflow_run` trigger waits for, or undefined
+ * when the workflow has none. GitHub requires `workflows:`; a scalar counts as
+ * a single name.
+ */
+export function workflowRunSources(workflow: ParsedWorkflow): string[] | undefined {
+	if (!workflow.events.has("workflow_run")) {
+		return undefined;
+	}
+	const settings = workflow.events.get("workflow_run");
+	const names = isRecord(settings) ? settings.workflows : undefined;
+	if (typeof names === "string") {
+		return [names];
+	}
+	return Array.isArray(names) ? names.filter((n): n is string => typeof n === "string") : [];
+}
+
+/** GitHub follows `workflow_run` chains at most this many levels deep. */
+const MAX_WORKFLOW_RUN_DEPTH = 3;
+
+/**
+ * The workflows that `workflow_run` would start after `started` complete,
+ * following chains up to GitHub's depth limit. A workflow without a `name:`
+ * is known to GitHub by its file path.
+ */
+export function workflowRunChain(
+	all: { path: string; workflow: ParsedWorkflow }[],
+	started: { path: string; workflow: ParsedWorkflow }[],
+): { path: string; workflow: ParsedWorkflow }[] {
+	const label = (w: { path: string; workflow: ParsedWorkflow }) => w.workflow.name ?? w.path;
+	const seen = new Set(started.map((w) => w.path));
+	const found: { path: string; workflow: ParsedWorkflow }[] = [];
+	let frontier = started;
+	for (let depth = 0; depth < MAX_WORKFLOW_RUN_DEPTH && frontier.length; depth++) {
+		const names = new Set(frontier.map(label));
+		frontier = all.filter(
+			(w) =>
+				!seen.has(w.path) &&
+				(workflowRunSources(w.workflow) ?? []).some((name) => names.has(name)),
+		);
+		for (const w of frontier) {
+			seen.add(w.path);
+			found.push(w);
+		}
+	}
+	return found;
 }
 
 /** The events a workflow's top-level `on:` names, each with its settings. */
@@ -221,26 +292,44 @@ export async function releaseWorkflows(
 	const invalid = results
 		.filter((r) => "workflow" in r && r.workflow === undefined)
 		.map((r) => r.path);
-	const matching = (test: (workflow: ParsedWorkflow) => boolean) =>
-		parsed
-			.filter((r) => test(r.workflow))
-			.map((r) => ({ path: r.path, name: r.workflow.name }));
+	const select = (test: (workflow: ParsedWorkflow) => boolean) =>
+		parsed.filter((r) => test(r.workflow));
+	const refs = (list: { path: string; workflow: ParsedWorkflow }[]) =>
+		list.map((r) => ({ path: r.path, name: r.workflow.name }));
+
+	const byRelease = select((w) => triggersOnRelease(w, actions));
+	const byTag = createsTag ? select(triggersOnTagCreation) : [];
+	const byWorkflowRun = workflowRunChain(parsed, [...byRelease, ...byTag]);
+	const usesWorkflowRun = parsed.some((r) => workflowRunSources(r.workflow) !== undefined);
 
 	const unchecked = files.slice(MAX_WORKFLOW_FILES).map((file) => file.path);
+	const unanalysed = [...unreadable, ...invalid];
 	const notes: string[] = [];
 	if (unreadable.length) {
 		notes.push(`Could not read: ${unreadable.join(", ")}.`);
 	}
 	if (invalid.length) {
-		notes.push(`Not valid YAML, so GitHub will not run them: ${invalid.join(", ")}.`);
+		notes.push(
+			`Could not be analysed, so they may still run: ${invalid.join(", ")}. GitHub's ` +
+				`workflow parser can accept files this one rejects.`,
+		);
 	}
 	if (unchecked.length) {
 		notes.push(`Only the first ${MAX_WORKFLOW_FILES} workflow files were checked.`);
 	}
+	if (usesWorkflowRun) {
+		notes.push(
+			"Some workflows run on `workflow_run`. GitHub reads those from the default " +
+				"branch, not this commit, so triggered_by_workflow_run is based on the files " +
+				"here and may differ from what actually runs.",
+		);
+	}
 
 	return {
-		triggered_by_release: matching((w) => triggersOnRelease(w, actions)),
-		triggered_by_tag_creation: createsTag ? matching(triggersOnTagCreation) : undefined,
+		triggered_by_release: refs(byRelease),
+		triggered_by_tag_creation: createsTag ? refs(byTag) : undefined,
+		triggered_by_workflow_run: byWorkflowRun.length ? refs(byWorkflowRun) : undefined,
+		unanalysed: unanalysed.length ? unanalysed : undefined,
 		release_actions: actions,
 		files_checked: checked.length - unreadable.length,
 		unchecked_files: unchecked.length ? unchecked : undefined,
